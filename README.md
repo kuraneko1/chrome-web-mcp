@@ -212,12 +212,25 @@ for visible-window mode), so users only need Docker:
 docker build -t chrome-web-mcp .
 ```
 
+The image runs as `chrome` (UID/GID 1000) with the Chromium sandbox enabled.
+Pass the included `docker/seccomp_profile.json` on every `docker run`: Docker's
+default seccomp policy blocks the user namespaces needed by the sandbox.
+The file is read by the Docker CLI on the client host, so use its absolute path
+in MCP configurations. The host must also permit unprivileged user namespaces.
+Do not override the image user with root or disable the sandbox.
+
+The profile is based on [Moby's default seccomp policy](https://github.com/moby/profiles/blob/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json),
+licensed under [Apache 2.0](docker/LICENSE). The only added rule allows `clone`,
+`setns`, and `unshare` for Chromium's namespaces, as described in
+[Playwright's Docker guidance](https://playwright.dev/docs/docker#crawling-and-scraping).
+The other default-deny restrictions are retained.
+
 ```json
 {
   "mcpServers": {
     "chrome-web": {
       "command": "docker",
-      "args": ["run", "-i", "--rm", "chrome-web-mcp"]
+      "args": ["run", "-i", "--rm", "--security-opt", "seccomp=/absolute/path/to/chrome-web-mcp/docker/seccomp_profile.json", "chrome-web-mcp"]
     }
   }
 }
@@ -229,7 +242,7 @@ you can keep the local and Docker versions available side by side:
 ```json
 "chrome-web-docker": {
   "type": "local",
-  "command": ["docker", "run", "--rm", "-i", "chrome-web-mcp:latest"],
+  "command": ["docker", "run", "--rm", "-i", "--security-opt", "seccomp=/absolute/path/to/chrome-web-mcp/docker/seccomp_profile.json", "chrome-web-mcp:latest"],
   "enabled": true,
   "timeout": 120000
 }
@@ -246,18 +259,24 @@ the Docker MCP server in visible Xephyr mode instead and retry the search:
 
 ```bash
 docker run -i --rm \
+  --security-opt seccomp=docker/seccomp_profile.json \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -e DISPLAY=$DISPLAY \
   -e CW_DISPLAY_MODE=xephyr \
-  -e XAUTHORITY=$XAUTHORITY \
+  -e XAUTHORITY=/tmp/.Xauthority \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
-  -v "$XAUTHORITY":"$XAUTHORITY":ro \
+  -v "$XAUTHORITY":/tmp/.Xauthority:ro \
   chrome-web-mcp
 ```
 
+Run this from a non-root Linux desktop account with a readable `XAUTHORITY`
+file. Matching its UID/GID lets Xephyr read a private mode-0600 cookie; `HOME=/tmp`
+keeps Chrome's home writable when that UID differs from the image's UID 1000.
+Custom profile, lock, or rate-database mounts must also be writable by that UID.
 This requires a Linux desktop X display and `Xephyr`. On Wayland/Mutter, the
 working Xauthority file may be a `.mutter-Xwaylandauth.*` file under
-`$XDG_RUNTIME_DIR` rather than `$XAUTHORITY`; mount that directory and set
-`XAUTHORITY` to the matching path inside the container. The resulting
+`$XDG_RUNTIME_DIR` rather than `$XAUTHORITY`; set the host's `XAUTHORITY` to that
+file before running the command above. The resulting
 `chrome-web-mcp` window belongs to the Docker process, and you must retry using
 that same Docker MCP session. For the simplest CAPTCHA recovery, use the local
 `chrome-web` entry with `show_browser: true` from the beginning.

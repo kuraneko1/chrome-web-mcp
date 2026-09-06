@@ -108,7 +108,7 @@ python3 -m pip install -e '.'
 ```json
 "chrome-web-docker": {
   "type": "local",
-  "command": ["docker", "run", "--rm", "-i", "chrome-web-mcp:latest"],
+  "command": ["docker", "run", "--rm", "-i", "--security-opt", "seccomp=/absolute/path/to/chrome-web-mcp/docker/seccomp_profile.json", "chrome-web-mcp:latest"],
   "enabled": true,
   "timeout": 120000
 }
@@ -177,6 +177,18 @@ DockerイメージにはPython依存関係、Chromium、Xvfb、Xephyrなどが�
 docker build -t chrome-web-mcp .
 ```
 
+イメージは非rootの`chrome`ユーザー（UID/GID 1000）で起動し、Chromiumの
+サンドボックスを有効にします。Dockerの既定制限では必要な名前空間を作れないため、
+起動時に同梱の`docker/seccomp_profile.json`を指定してください。
+MCP設定ではDocker CLIを実行するホスト上の絶対パスを使います。ホスト側でも
+非特権ユーザーによる名前空間の作成が許可されている必要があります。
+rootへの切り替えやサンドボックスの無効化で回避しないでください。
+
+この設定は[Mobyの既定seccomp設定](https://github.com/moby/profiles/blob/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json)を基に、
+[PlaywrightのDocker向け案内](https://playwright.dev/docs/docker#crawling-and-scraping)に従って
+`clone`、`setns`、`unshare`の許可規則だけを追加しています。他の既定制限は維持し、
+[Apache 2.0ライセンス](docker/LICENSE)に従って配布します。
+
 通常のDocker版はコンテナ内のXvfbを使用するため、窓は表示されません。
 opencodeでは`chrome-web-docker`として登録できます。
 
@@ -191,17 +203,23 @@ Xauthorityをコンテナへ渡します。
 
 ```bash
 docker run -i --rm \
+  --security-opt seccomp=docker/seccomp_profile.json \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -e DISPLAY=$DISPLAY \
   -e CW_DISPLAY_MODE=xephyr \
-  -e XAUTHORITY=$XAUTHORITY \
+  -e XAUTHORITY=/tmp/.Xauthority \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
-  -v "$XAUTHORITY":"$XAUTHORITY":ro \
+  -v "$XAUTHORITY":/tmp/.Xauthority:ro \
   chrome-web-mcp
 ```
 
+読み取り可能な`XAUTHORITY`を設定した、非rootのデスクトップユーザーとして実行します。
+UID/GIDをホストと合わせることで、権限0600の認証ファイルを読み取れます。
+`HOME=/tmp`はUIDが1000以外でもChromeのホームに書き込めるようにする指定です。
+プロファイル、ロック、検索間隔DBをマウントする場合も、そのUIDに書き込み権限が必要です。
 Linuxのデスクトップ環境とXephyrが必要です。Wayland/Mutterでは、
 `$XDG_RUNTIME_DIR`内の`.mutter-Xwaylandauth.*`が認証ファイルになる場合が
-あります。詳しい注意点は英語版READMEのDocker節にも記載しています。
+あります。その場合は、ホストの`XAUTHORITY`に該当ファイルを設定してから実行してください。
 
 最も簡単なCAPTCHA対策は、デスクトップ環境では最初からローカル版の
 `show_browser: true`を使うことです。
