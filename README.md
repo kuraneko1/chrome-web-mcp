@@ -2,6 +2,9 @@
 
 [日本語版 README](README.jp.md)
 
+> **Supported OS: Linux only.** Windows and macOS are not supported. Using
+> Docker does not change the host OS support policy.
+
 > [!CAUTION]
 > Single-session use only: one client process, one browser, sequential searches.
 >
