@@ -305,6 +305,12 @@ GoogleがCAPTCHAを表示すると、ツールは次のような結果を返し�
 - ホストのWaylandセッションではなく、明示したX11仮想ディスプレイ上でChromeを動かします
 - これは一般的なリモートブラウザ操作APIではありません
 
+## 謝辞
+
+ブラウザを使ったWeb処理は、当初[antirez/ds4](https://github.com/antirez/ds4)を
+土台として実装し、その後PythonおよびMCP向けに大幅に再設計しています。適用される
+MITライセンスの通知は[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)を参照してください。
+
 ## 開発と検証
 
 開発者向けのセットアップ、テスト、ビルド手順は

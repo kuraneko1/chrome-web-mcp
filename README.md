@@ -478,6 +478,13 @@ search. With `show_browser: false` (Xvfb), wait a while and retry. Automatic
 Xpra attach is disabled unless `CW_XPRA_EXPOSE=1` is set, because it once
 crashed the desktop session.
 
+## Acknowledgements
+
+Browser-backed web tooling was originally derived from
+[antirez/ds4](https://github.com/antirez/ds4) and subsequently substantially
+reworked for MCP. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the
+applicable MIT license notice.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, test (`pytest -q -m 'not live'` for deterministic only), and build steps.
