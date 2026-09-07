@@ -212,7 +212,11 @@ for visible-window mode), so users only need Docker:
 docker build -t chrome-web-mcp .
 ```
 
-The image runs as `chrome` (UID/GID 1000) with the Chromium sandbox enabled.
+Without `--user`, the image runs as the non-root `chrome` user defined in
+`Dockerfile` (UID/GID `1000:1000`) with the Chromium sandbox enabled.
+The visible Xephyr example below overrides this default with your host account's
+UID/GID.
+
 Pass the included `docker/seccomp_profile.json` on every `docker run`: Docker's
 default seccomp policy blocks the user namespaces needed by the sandbox.
 The file is read by the Docker CLI on the client host, so use its absolute path
@@ -270,8 +274,10 @@ docker run -i --rm \
 ```
 
 Run this from a non-root Linux desktop account with a readable `XAUTHORITY`
-file. Matching its UID/GID lets Xephyr read a private mode-0600 cookie; `HOME=/tmp`
-keeps Chrome's home writable when that UID differs from the image's UID 1000.
+file. The `--user "$(id -u):$(id -g)"` option overrides the image default with the
+UID/GID of the host account running the command. Matching the Xauthority file
+owner's UID lets Xephyr read a private mode-0600 cookie; `HOME=/tmp` keeps Chrome's
+home writable when that UID differs from the image's UID 1000.
 Custom profile, lock, or rate-database mounts must also be writable by that UID.
 This requires a Linux desktop X display and `Xephyr`. On Wayland/Mutter, the
 working Xauthority file may be a `.mutter-Xwaylandauth.*` file under

@@ -177,8 +177,11 @@ DockerイメージにはPython依存関係、Chromium、Xvfb、Xephyrなどが�
 docker build -t chrome-web-mcp .
 ```
 
-イメージは非rootの`chrome`ユーザー（UID/GID 1000）で起動し、Chromiumの
-サンドボックスを有効にします。Dockerの既定制限では必要な名前空間を作れないため、
+`--user`を指定しない場合は、Dockerfileで定義した非rootの`chrome`ユーザー
+（UID/GID `1000:1000`）で起動し、Chromiumのサンドボックスを有効にします。
+後述のXephyr表示の実行例では、この既定値をホストユーザーのUID/GIDで上書きします。
+
+Dockerの既定制限では必要な名前空間を作れないため、
 起動時に同梱の`docker/seccomp_profile.json`を指定してください。
 MCP設定ではDocker CLIを実行するホスト上の絶対パスを使います。ホスト側でも
 非特権ユーザーによる名前空間の作成が許可されている必要があります。
@@ -214,7 +217,9 @@ docker run -i --rm \
 ```
 
 読み取り可能な`XAUTHORITY`を設定した、非rootのデスクトップユーザーとして実行します。
-UID/GIDをホストと合わせることで、権限0600の認証ファイルを読み取れます。
+上の`--user "$(id -u):$(id -g)"`は、コマンドを実行するホストユーザーの
+UID/GIDを取得して既定値を上書きします。認証ファイルの所有者とUIDを合わせることで、
+権限0600の認証ファイルを読み取れます。
 `HOME=/tmp`はUIDが1000以外でもChromeのホームに書き込めるようにする指定です。
 プロファイル、ロック、検索間隔DBをマウントする場合も、そのUIDに書き込み権限が必要です。
 Linuxのデスクトップ環境とXephyrが必要です。Wayland/Mutterでは、
