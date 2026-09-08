@@ -25,10 +25,10 @@ or any machine without a desktop display, set:
 { "show_browser": false }
 ```
 
-This uses hidden Xvfb instead of Xephyr. The built-in default is `true` for
-desktop use, so explicitly set `false` on headless machines and restart the
-MCP client after changing the file. Docker already sets hidden Xvfb inside the
-container by default.
+On Linux this uses hidden Xvfb instead of Xephyr. On macOS it uses native
+`--headless=new` Chrome. The built-in default is `true` for desktop use, so
+explicitly set `false` on headless machines and restart the MCP client after
+changing the file. Docker already sets hidden Xvfb inside the container.
 
 ## Settings
 
@@ -36,14 +36,12 @@ container by default.
 
 Controls whether the browser window is visible:
 
-- `true`: show a window titled `chrome-web-mcp` on the desktop. Use this when
-  you need to see or manually solve a CAPTCHA.
-- `false`: run Chrome on a hidden virtual display.
+- `true`: visible browser. Linux uses Xephyr; macOS uses a normal native Chrome window.
+- `false`: hidden browser. Linux uses Xvfb; macOS uses `--headless=new`.
 
-When `show_browser` is `true`, the server uses Xephyr. It requires a desktop
-`DISPLAY` and the `Xephyr` program. It is not available on a headless machine
-without a desktop display. The built-in default is `true`, so use `false` on a
-headless machine or when you do not want a window.
+On Linux, visible mode requires a desktop `DISPLAY` and Xephyr. On macOS no
+`DISPLAY` or X11 component is required. The built-in default is `true`, so use
+`false` when you do not want a window.
 
 For the Docker version, `show_browser` is not read from the host config file.
 The Docker image runs hidden Xvfb by default. If it reports

@@ -2,8 +2,10 @@
 
 [English README](README.md)
 
-> **対応OS: Linuxのみ。** WindowsとmacOSはサポート対象外です。Dockerを
-> 使用する場合も、ホストOSの対応条件は変わりません。
+> **対応OS: Linux / macOS。** macOSではX11を使わず、通常のMac版Chromeを
+> visibleまたは`--headless=new`で起動します。Windowsは未対応です。
+> macOSのセットアップとプロジェクト内Chrome for Testingについては
+> [docs/macos.md](docs/macos.md)を参照してください。
 
 > [!CAUTION]
 > 1つのMCPサーバープロセスにつき、ブラウザは1つだけ使用してください。
@@ -13,8 +15,8 @@
 >   開始すると`pace_warning`が返ります。
 > - `pace_warning`はブロックではありませんが、短時間に大量検索を続けると
 >   GoogleからCAPTCHAを要求されることがあります。CAPTCHAが出た場合は、
->   数分待ってから再試行してください。`show_browser: true`（Xephyr）なら
->   `chrome-web-mcp`の窓でCAPTCHAを解いてから同じ検索を再試行できます。
+>   数分待ってから再試行してください。`show_browser: true`なら表示されている
+>   Chrome/Xephyrの窓でCAPTCHAを解いてから同じ検索を再試行できます。
 > - 別々のMCPプロセスは、それぞれ別のブラウザを起動します。複数のCLIや
 >   MCPクライアントから同時に大量検索しないでください。
 
@@ -28,21 +30,42 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 ## 特徴
 
 - 実際のChrome/Chromiumを使ったJavaScript対応のGoogle検索とページ取得
-- Xephyr（窓あり）またはXvfb（窓なし）による独立した仮想ディスプレイ
+- LinuxではXephyr/Xvfb、macOSではnative/headless Chromeを使用
 - `trafilatura`と`html2text`による読みやすいMarkdown整形
 - `hl`（Googleの表示言語）と`gl`（検索地域）の指定
 - 公開アドレスだけに接続する検証プロキシ。localhostやプライベートIPを拒否
 - Google検索の開始間隔をSQLiteでプロセス間共有
 - Chrome、表示サーバー、プロキシの終了処理と孤児プロセスの回収
-- Linux専用
+- Linux / macOS対応
 
 ## 必要環境
 
 - Python 3.10以上
-- Google Chrome、Google Chrome for Testing、またはChromium
-- 窓を表示する場合: Linuxの`Xephyr`とデスクトップの`DISPLAY`
-- 窓を表示しない場合: Linuxの`Xvfb`
-- CAPTCHAを対話的に解除する場合（任意）: `xpra`
+- Google Chrome、Google Chrome for Testing、またはChromium。macOSでは
+  `CW_CHROME`の次にプロジェクト内`.local-chrome`のChrome for Testingを
+  自動検出するため、通常のChromeを`/Applications`へ入れる必要はありません
+- Linuxで窓を表示する場合: `Xephyr`とデスクトップの`DISPLAY`
+- Linuxで窓を表示しない場合: `Xvfb`
+- LinuxでCAPTCHAを対話的に解除する場合（任意）: `xpra`
+- macOSではXvfb/Xephyr/DISPLAYは不要
+
+## macOSでのインストール
+
+通常のChromeを`/Applications`へインストールせず、プロジェクト内のChrome for
+Testingだけで動かせます。
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[test]'
+python scripts/install-chrome-for-testing.py
+chrome-web-mcp
+```
+
+取得したブラウザはgit管理外の`.local-chrome/`へ保存されます。ブラウザの
+ダウンロードはこのスクリプトを明示的に実行した場合だけ行われ、MCPサーバーの
+起動時に勝手にダウンロードすることはありません。詳細は
+[`docs/macos.md`](docs/macos.md)を参照してください。
 
 ## ヘッドレス環境
 
@@ -59,10 +82,9 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 `CW_CONFIG`で別の場所を指定できます。変更後はMCPクライアントを再起動して
 ください。
 
-`show_browser: false`ではChromeを隠しXvfb上で起動します。内蔵デフォルトは
-デスクトップ利用向けの`true`なので、ヘッドレス環境ではこの設定を省略しないで
-ください。Docker版はコンテナ内でXvfbを使用するため、通常はホストのDISPLAYを
-設定する必要はありません。
+`show_browser: false`では、Linuxは隠しXvfb、macOSは`--headless=new`で
+Chromeを起動します。内蔵デフォルトはデスクトップ利用向けの`true`です。
+Docker版はLinuxコンテナ内でXvfbを使用します。
 
 ## Linuxでのインストール
 
@@ -139,7 +161,8 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 }
 ```
 
-- `show_browser`: `true`で`chrome-web-mcp`の窓を表示、`false`で非表示
+- `show_browser`: `true`でブラウザを表示、`false`で非表示。macOSでは
+  `true`がnative Chrome、`false`が`--headless=new`
 - `hl`: Googleの表示言語。`ja`は日本語、`en`は英語
 - `gl`: Googleの検索地域。`jp`は日本、`us`は米国
 - `limit`: `google_search`の既定結果数（1から20）
@@ -275,9 +298,9 @@ docker build -t chrome-web-mcp /absolute/path/to/chrome-web-mcp
 
 ### `health_check`
 
-引数はありません。表示モード、Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち
-時間、直近の検索数、CAPTCHA時刻を返します。health_check自体はブラウザを起動
-しません。
+引数はありません。platform、表示モード、Chrome binary/version、GPU backend、
+Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち時間、直近の検索数、CAPTCHA時刻を
+返します。health_check自体はブラウザを起動しません。
 
 ## CAPTCHAについて
 
@@ -293,16 +316,16 @@ GoogleがCAPTCHAを表示すると、ツールは次のような結果を返し�
 }
 ```
 
-`show_browser: true`なら、デスクトップ上の`chrome-web-mcp`窓でCAPTCHAを解き、
-同じ検索を再試行します。`false`なら数分待ってから再試行してください。
+`show_browser: true`なら、デスクトップ上の表示中ブラウザでCAPTCHAを解き、
+同じ検索を再試行します。`false`なら数分待つかvisible modeで再起動してください。
 
 ## セキュリティと範囲
 
 - 任意のページコンテキストJavaScriptを実行するツールは提供しません
 - ブラウザのHTTP(S)/WebSocket接続は公開アドレスに限定します
 - URL内の認証情報や明らかな秘密情報パターンを拒否します
-- サーバーごとにChromeと仮想ディスプレイを所有し、終了時に回収します
-- ホストのWaylandセッションではなく、明示したX11仮想ディスプレイ上でChromeを動かします
+- サーバーごとにChromeと必要な表示backendを所有し、終了時に回収します
+- Linuxは独立X11 display、macOSは独立temporary profileのnative/headless Chromeを使います
 - これは一般的なリモートブラウザ操作APIではありません
 
 ## 謝辞
