@@ -119,6 +119,7 @@ def test_captcha_error_is_marked_for_the_mcp_client(monkeypatch):
 
 def test_expose_for_human_starts_shadow_and_attach(monkeypatch):
     calls = []
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
 
     class FakeProcess:
         pid = 12345
@@ -314,12 +315,14 @@ def test_fetch_page_runs_concurrent_calls_on_separate_tabs(monkeypatch):
 
 
 def test_display_mode_defaults_to_xephyr(monkeypatch):
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
     monkeypatch.delenv("CW_DISPLAY_MODE", raising=False)
     monkeypatch.setattr(server, "CONFIG", dict(server._CONFIG_DEFAULTS))
     assert server.BrowserRuntime().display_mode == "xephyr"
 
 
 def test_show_browser_false_selects_xvfb(monkeypatch):
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
     monkeypatch.delenv("CW_DISPLAY_MODE", raising=False)
     config = dict(server._CONFIG_DEFAULTS)
     config["show_browser"] = False
@@ -328,6 +331,7 @@ def test_show_browser_false_selects_xvfb(monkeypatch):
 
 
 def test_xephyr_mode_requires_user_display(monkeypatch):
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
     monkeypatch.setenv("CW_DISPLAY_MODE", "xephyr")
     runtime = server.BrowserRuntime()
     runtime.user_display = None
@@ -340,6 +344,7 @@ def test_xephyr_mode_requires_user_display(monkeypatch):
 
 
 def test_xpra_expose_is_opt_in(monkeypatch):
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
     monkeypatch.delenv("CW_XPRA_EXPOSE", raising=False)
     assert server._xpra_expose_enabled() is False
     monkeypatch.setenv("CW_XPRA_EXPOSE", "1")

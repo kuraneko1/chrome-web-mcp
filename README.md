@@ -2,8 +2,10 @@
 
 [日本語版 README](README.jp.md)
 
-> **Supported OS: Linux only.** Windows and macOS are not supported. Using
-> Docker does not change the host OS support policy.
+> **Supported OS: Linux and macOS.** The macOS port uses native Chrome (visible
+> or `--headless=new`) and does not require X11. Windows is not supported.
+> See [docs/macos.md](docs/macos.md) for macOS setup, project-local Chrome for
+> Testing, and runtime details.
 
 > [!CAUTION]
 > Single-session use only: one client process, one browser, sequential searches.
@@ -13,9 +15,9 @@
 > - A warning is advisory, not a block: searches keep running. But Google
 >   counts total volume too — sustained barrages end in CAPTCHA regardless of
 >   pacing (observed after dozens of searches in one session). When challenged:
->   wait a few minutes and retry in headless (`xvfb`) mode — it usually clears
->   by itself; in visible (`xephyr`) mode, solve the challenge in the
->   `chrome-web-mcp` window yourself, then retry. `last_captcha_at` in
+>   wait a few minutes and retry in hidden mode — it usually clears by itself;
+>   in visible mode, solve the challenge in the browser window yourself, then
+>   retry. `last_captcha_at` in
 >   `health_check` shows the last hit.
 > - opencode + subagents: SAFE. All agents share one server process and one
 >   browser. Concurrent searches are pooled in a shared query queue
@@ -37,9 +39,8 @@ stdio command.
 
 ## Features
 
-- JS-rendered Google search + public URL fetch through a real (non-headless)
-  Chrome on a private virtual display (Xephyr when visible, Xvfb when hidden)
-  — harder to bot-detect than `--headless`.
+- JS-rendered Google search + public URL fetch through real Chrome. Linux uses
+  Xephyr/Xvfb; macOS uses native visible Chrome or native `--headless=new`.
 - Shaped markdown by default (`trafilatura` + `html2text`, pure-Python, no
   extra service), with full-text fallback and follow-up link targets.
 - Language/region hints (`hl`/`gl`) for reproducible JA/EN results.
@@ -49,29 +50,49 @@ stdio command.
   credential-bearing URLs are blocked, including post-redirect targets.
 - Shared SQLite pacing for Google searches across MCP processes.
 - `health_check` for display/browser/queue/CAPTCHA observability.
-- Linux only (Xvfb/Xephyr, `fcntl`, process groups).
+- Linux + macOS, with platform-specific browser/runtime isolation.
 
 ## Requirements
 
 - Python 3.10 or newer
-- Google Chrome, Google Chrome for Testing, or Chromium
+- Google Chrome, Google Chrome for Testing, or Chromium. On macOS this port
+  first auto-detects a project-local Chrome for Testing build under
+  `.local-chrome` after `CW_CHROME`, so a system Chrome install is optional.
 - `Xephyr` on Linux for the default visible-window mode
 - `Xvfb` on Linux for hidden-window mode
 - `xpra` on Linux if interactive CAPTCHA recovery is desired
 
-The Python dependencies are installed with the package. Chrome and Xvfb remain
-host prerequisites because they are external browser processes.
+The Python dependencies are installed with the package. Chrome remains an
+external host prerequisite. Xvfb/Xephyr are Linux-only prerequisites.
 
 Non-headless Chrome on Xvfb is intentional: `--headless` is easier to
 bot-detect, so Xvfb is kept as a requirement even though it is heavier.
 
 ## Platform support
 
-Linux only. Windows and macOS are not supported: this server depends on
-`Xvfb`/`Xephyr`, Chromium with `--ozone-platform=x11`, `fcntl.flock`, and
-process-group signaling (`killpg`), none of which work as-is on Windows.
-A Windows/macOS port would need headless Chrome plus a different locking
-scheme. Docker helps only on a Linux host with an X server for `xephyr` mode.
+Linux keeps the upstream X11 backend: Xephyr for visible mode and Xvfb for
+hidden mode. macOS uses native Chrome directly: visible mode opens a normal
+Chrome window and hidden mode uses `--headless=new`. macOS does not require
+`DISPLAY`, Xvfb, Xephyr, or `--ozone-platform=x11`. `fcntl.flock`, POSIX process
+groups, and process birth identity are retained; macOS process identity uses
+`psutil` instead of `/proc`. Windows is not supported.
+
+### macOS quickstart
+
+macOS users can keep Chrome completely local to the checkout:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[test]'
+python scripts/install-chrome-for-testing.py
+chrome-web-mcp
+```
+
+The installer fetches Google's official Chrome for Testing build for the host
+architecture into the git-ignored `.local-chrome/` directory. Browser download
+is always explicit; starting the MCP server never downloads Chrome. See
+[docs/macos.md](docs/macos.md) for details.
 
 ## Headless environments
 
@@ -85,8 +106,8 @@ machine without a desktop display, set `show_browser` to `false`:
 ```
 
 Edit `~/.config/chrome-web-mcp/config.json` (or the file specified by
-`CW_CONFIG`) and restart the MCP client. This forces Chrome onto hidden Xvfb
-and avoids the Xephyr startup error caused by the lack of a user `DISPLAY`.
+`CW_CONFIG`) and restart the MCP client. On Linux this selects hidden Xvfb; on
+macOS it selects native `--headless=new` Chrome.
 
 The built-in default is `true` for desktop use, so do not omit this setting on
 a headless machine. A Docker installation already sets
@@ -143,7 +164,8 @@ opencode (`~/.config/opencode/opencode.json`, Linux path example):
 Notes:
 
 - Replace `/absolute/path/to/chrome-web-mcp` with your checkout path.
-- `CW_CHROME=/usr/bin/chromium` only if auto-detection misses your binary.
+- Set `CW_CHROME` only if auto-detection misses your binary. On macOS the normal
+  stable app path is `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`.
 - Concurrent calls within one server are supported. Searches are serialized;
   fetches use independent tabs and share a serialized browser startup.
 - `xephyr` mode needs a real desktop `DISPLAY` plus `xserver-xephyr`;
@@ -417,6 +439,8 @@ Optional environment variables:
   Settings become tool defaults when the caller omits them. Unknown keys warn
   on stderr; invalid values warn and keep the built-in default per key.
 - `CW_CHROME` — explicit Chrome/Chromium executable path.
+  On macOS, when unset, a project-local `.local-chrome/**/Google Chrome for
+  Testing.app` is preferred before system Chrome/Chromium apps.
 - `CW_PROFILE_DIR` — explicit browser profile directory. By default, each
   server process uses an isolated per-PID temporary profile.
 - `CW_LOCK_PATH` — explicit lock-file path when `CW_PROFILE_DIR` is set.
@@ -425,12 +449,9 @@ Optional environment variables:
   separate MCP processes of the same user share one limiter.
 - `CW_MIN_DELAY` / `CW_MAX_DELAY` — randomized gap (seconds) between Google
   search starts. Defaults `1.0` / `2.5`.
-- `CW_DISPLAY_MODE` — advanced environment override for `show_browser`:
-  `xvfb` runs Chrome on a private, fully hidden display, while `xephyr` runs
-  Chrome inside a nested `Xephyr` window titled `chrome-web-mcp` on your
-  desktop. The latter is visible, minimizable, and movable, but tool calls can
-  never pop a window to the front outside of it. Requires `Xephyr`
-  (`xserver-xephyr`) and a user `DISPLAY`.
+- `CW_DISPLAY_MODE` — advanced environment override for `show_browser`.
+  Linux uses `xvfb` or `xephyr`. macOS uses `headless` or `native` (Linux names
+  are accepted as compatibility aliases on macOS).
 - When `CW_DISPLAY_MODE=xephyr`, the server preserves an explicit `XAUTHORITY`
   or automatically discovers Mutter's `.mutter-Xwaylandauth.*` file under
   `XDG_RUNTIME_DIR`, then falls back to `~/.Xauthority`. This lets stdio MCP
@@ -458,9 +479,10 @@ through this Google-search queue.
   a local validating proxy; private destinations are rejected before connecting.
   Input URLs also reject embedded credentials and recognizable secret patterns.
   This does not classify every possible secret in arbitrary page URLs/content.
-- Each server owns and cleans up its Chrome and Xvfb process groups.
-- Chrome is explicitly forced onto the private X11/Xvfb display, even when the
-  host desktop session uses Wayland; the user desktop should not be surfaced.
+- Each server owns and cleans up its Chrome and platform display process groups.
+- Linux Chrome is forced onto its private X11 display. macOS Chrome uses a
+  separate temporary profile and native/headless backend without touching the
+  user's normal Chrome profile.
 - SIGTERM and SIGINT trigger browser and temporary-profile cleanup before exit.
   Startup recovers recorded Chrome/display processes using PID and start time,
   not broad process-name matching. Legacy profiles without process records can
@@ -472,11 +494,10 @@ browser-backed search/fetch MCP server, not a general remote browser-control
 API.
 
 When Google presents a CAPTCHA during `google_search`, the server returns
-`captcha_required: true`. With `show_browser: true` (Xephyr), solve the
-challenge in the `chrome-web-mcp` window on your desktop, then retry the same
-search. With `show_browser: false` (Xvfb), wait a while and retry. Automatic
-Xpra attach is disabled unless `CW_XPRA_EXPOSE=1` is set, because it once
-crashed the desktop session.
+`captcha_required: true`. With `show_browser: true`, solve the challenge in the
+visible Chrome/Xephyr window and retry the same search. With
+`show_browser: false`, wait a while and retry or restart in visible mode.
+Automatic Xpra attach is Linux-only and disabled unless explicitly enabled.
 
 ## Acknowledgements
 

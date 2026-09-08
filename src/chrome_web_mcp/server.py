@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Focused DS4-derived Google search + URL fetch MCP server.
 
-Runs a normal Chrome window inside Xvfb, renders pages with JavaScript through
-CDP, and exposes a stateless Google search tool plus a public-URL fetch tool
-(JS-rendered readable text). Fetch targets and their post-redirect final URLs
-are validated fail-closed; arbitrary page-context JavaScript is never exposed.
+Runs Chrome through a platform browser backend (X11 virtual displays on Linux,
+native/headless Chrome on macOS), renders pages with JavaScript through CDP, and
+exposes a stateless Google search tool plus a public-URL fetch tool. Fetch
+targets and their post-redirect final URLs are validated fail-closed; arbitrary
+page-context JavaScript is never exposed.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ import websockets
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from chrome_web_mcp.network import PublicNetworkProxy
+from chrome_web_mcp import platform_runtime
 
 try:
     import trafilatura
@@ -167,10 +169,16 @@ async def _resolve_candidate_url(href: str) -> str | None:
             return None
         # The only fetched host is Google. The external Location is validated but
         # is never requested here, preventing redirect-based SSRF.
+        user_agent = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 Chrome/150 Safari/537.36"
+            if platform_runtime.platform_key() == "macos"
+            else "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36"
+        )
         async with httpx.AsyncClient(follow_redirects=False, timeout=8.0) as client:
             response = await client.get(
                 current,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36"},
+                headers={"User-Agent": user_agent},
             )
         location = response.headers.get("location")
         if not location or response.status_code not in {301, 302, 303, 307, 308}:
@@ -228,13 +236,8 @@ def _terminate_owned_process(proc: subprocess.Popen | None, timeout: float) -> N
 
 
 def _process_identity(pid: int) -> dict:
-    """Identify a process without relying on a reusable PID alone (Linux)."""
-    proc_path = Path(f"/proc/{pid}")
-    if proc_path.stat().st_uid != os.getuid():
-        raise ValueError("Process is owned by another user")
-    stat = (proc_path / "stat").read_text()
-    fields = stat[stat.rfind(")") + 2:].split()
-    return {"pid": pid, "start_ticks": fields[19]}
+    """Identify a same-user process without relying on a reusable PID alone."""
+    return platform_runtime.process_identity(pid)
 
 
 def _stop_recorded_process(record: dict) -> None:
@@ -256,7 +259,7 @@ def _stop_recorded_process(record: dict) -> None:
 
 
 _CONFIG_DEFAULTS = {
-    "show_browser": True,  # true: visible Xephyr window | false: hidden Xvfb
+    "show_browser": True,  # Linux: Xephyr/Xvfb | macOS: native/headless
     "hl": "ja",
     "gl": "jp",
     "limit": 5,
@@ -352,7 +355,7 @@ CONFIG = _load_config()
 
 
 class BrowserRuntime:
-    """Own one isolated Xvfb/Chrome pair for this MCP process."""
+    """Own one isolated browser session and its platform display backend."""
 
     def __init__(self) -> None:
         self.xvfb: subprocess.Popen | None = None
@@ -369,9 +372,15 @@ class BrowserRuntime:
         # CW_DISPLAY_MODE is an advanced environment override. The JSON
         # show_browser boolean is the user-facing switch.
         env_display_mode = os.environ.get("CW_DISPLAY_MODE", "").strip().lower()
-        self.display_mode = env_display_mode or (
-            "xephyr" if CONFIG["show_browser"] else "xvfb"
+        self.display_mode = platform_runtime.browser_mode(
+            bool(CONFIG["show_browser"]), env_display_mode
         )
+        self.gpu_info: dict[str, Any] = {
+            "gpu_device": None,
+            "gpu_renderer": None,
+            "gpu_backend": "UNKNOWN",
+            "metal_active": None,
+        }
         # A long-lived background search tab, reused across queries so we do not
         # repeatedly open/close targets (which looks like bot activity to Google).
         self.search_target_id: str | None = None
@@ -381,7 +390,10 @@ class BrowserRuntime:
         self.fetch_target_id: str | None = None
 
     # Fingerprint hardening, injected into every new document before scripts run.
-    _STEALTH_INIT_JS = r"""
+    # Linux keeps the upstream spoof for compatibility.  macOS intentionally
+    # avoids pretending to be Windows/Intel because that contradicts native
+    # Chrome's own UA/WebGL/ANGLE fingerprint and can make detection worse.
+    _STEALTH_INIT_JS_LINUX = r"""
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
     window.chrome = window.chrome || { runtime: {} };
     Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
@@ -393,6 +405,20 @@ class BrowserRuntime:
       return _qp.call(this, p);
     };
     """
+
+    _STEALTH_INIT_JS_MAC = r"""
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    window.chrome = window.chrome || { runtime: {} };
+    Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
+    """
+
+    @staticmethod
+    def _stealth_init_js() -> str:
+        return (
+            BrowserRuntime._STEALTH_INIT_JS_MAC
+            if platform_runtime.platform_key() == "macos"
+            else BrowserRuntime._STEALTH_INIT_JS_LINUX
+        )
 
     @staticmethod
     def _browser_environment(display: str) -> dict[str, str]:
@@ -445,6 +471,10 @@ class BrowserRuntime:
 
     def expose_for_human(self) -> None:
         """Attach the private Xvfb display to the user's desktop via Xpra."""
+        if platform_runtime.platform_key() == "macos":
+            if self.display_mode == "native":
+                return
+            raise RuntimeError("CAPTCHA is in headless Chrome; restart with show_browser=true")
         if not self.display:
             raise RuntimeError("CAPTCHA browser display is not ready")
         if not self.user_display:
@@ -514,18 +544,7 @@ class BrowserRuntime:
 
     @staticmethod
     def _chrome_executable() -> str:
-        configured = os.environ.get("CW_CHROME")
-        candidates = [configured] if configured else []
-        candidates += [
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-        ]
-        for candidate in candidates:
-            if candidate and os.access(candidate, os.X_OK):
-                return candidate
-        raise RuntimeError("No supported Chrome/Chromium executable found")
+        return platform_runtime.discover_chrome()
 
     def _acquire_lock(self) -> None:
         """Acquire the profile lock, embedding our pid/starttime for forensics.
@@ -582,22 +601,16 @@ class BrowserRuntime:
                     pid = None
         if pid is None:
             return f"Lock content: {content[:80]!r} (no pid recorded)."
-        stat_path = Path(f"/proc/{pid}/stat")
-        try:
-            stat = stat_path.read_text(encoding="utf-8")
-            comm = stat[stat.rfind(")") + 2 :].split()
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0].decode(
-                "utf-8", "replace"
-            )
+        alive, command = platform_runtime.process_summary(pid)
+        if alive:
             return (
-                f"Holder pid {pid} is ALIVE ({cmdline[:120] or comm[0] if comm else 'unknown'}); "
+                f"Holder pid {pid} is ALIVE ({command or 'unknown'}); "
                 "it owns the lock legitimately and will release it on exit."
             )
-        except OSError:
-            return (
-                f"Holder pid {pid} is DEAD — the flock released automatically; "
-                "this instance is acquiring the freed lock."
-            )
+        return (
+            f"Holder pid {pid} is DEAD — the flock released automatically; "
+            "this instance is acquiring the freed lock."
+        )
 
     @staticmethod
     def _sweep_orphans() -> None:
@@ -623,8 +636,8 @@ class BrowserRuntime:
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
-                # New profiles record Chrome AND the private display, including
-                # start ticks to avoid terminating an unrelated reused PID.
+                # New profiles record Chrome AND any private display, including
+                # process birth identity to avoid terminating an unrelated reused PID.
                 try:
                     records = json.loads((entry / ".owned-processes.json").read_text())
                     if isinstance(records, list):
@@ -634,17 +647,12 @@ class BrowserRuntime:
                 except (OSError, ValueError):
                     pass
                 # Upgrade path for old profiles: exact argv matching, never
-                # pkill regexes or option-like patterns. Old Xvfb cannot be
-                # safely identified without a manifest, so leave it alone.
-                for proc_path in Path("/proc").iterdir():
-                    if not proc_path.name.isdigit():
-                        continue
-                    try:
-                        args = (proc_path / "cmdline").read_bytes().split(b"\0")
-                        if os.fsencode(f"--user-data-dir={entry}") in args:
-                            _stop_recorded_process(_process_identity(int(proc_path.name)))
-                    except (OSError, ValueError, IndexError):
-                        pass
+                # pkill regexes or option-like patterns. Old display processes
+                # cannot be safely identified without a manifest, so leave them.
+                for record in platform_runtime.processes_with_exact_arg(
+                    f"--user-data-dir={entry}"
+                ):
+                    _stop_recorded_process(record)
                 try:
                     shutil.rmtree(entry, ignore_errors=True)
                 except OSError:
@@ -778,15 +786,11 @@ class BrowserRuntime:
         _terminate_owned_process(minimizer, 2)
         raise RuntimeError("Xephyr failed its readiness check")
 
-    def _start_chrome(self, display: str) -> tuple[int, str]:
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        DEVTOOLS_FILE.unlink(missing_ok=True)
-        env = self._browser_environment(display)
+    def _chrome_command(self) -> list[str]:
         if self.proxy is None:
             raise RuntimeError("Public-network proxy is not ready")
         command = [
             self._chrome_executable(),
-            "--ozone-platform=x11",
             "--remote-debugging-address=127.0.0.1",
             "--remote-debugging-port=0",
             f"--proxy-server={self.proxy.url}",
@@ -797,9 +801,6 @@ class BrowserRuntime:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-sync",
-            "--password-store=basic",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
             "--mute-audio",
             "--disable-blink-features=AutomationControlled",
             "--lang=ja-JP",
@@ -807,8 +808,31 @@ class BrowserRuntime:
             "--window-position=0,0",
             "about:blank",
         ]
+        if platform_runtime.platform_key() == "linux":
+            command[1:1] = [
+                "--ozone-platform=x11",
+                "--password-store=basic",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+            ]
+        elif platform_runtime.platform_key() == "macos":
+            command.insert(1, "--use-mock-keychain")
+            if self.display_mode == "headless":
+                command.insert(1, "--headless=new")
         if os.geteuid() == 0:
             command.insert(1, "--no-sandbox")
+        return command
+
+    def _start_chrome(self, display: str | None) -> tuple[int, str]:
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        DEVTOOLS_FILE.unlink(missing_ok=True)
+        if platform_runtime.platform_key() == "linux":
+            if not display:
+                raise RuntimeError("Linux Chrome needs a private X11 display")
+            env = self._browser_environment(display)
+        else:
+            env = os.environ.copy()
+        command = self._chrome_command()
         proc = subprocess.Popen(
             command,
             env=env,
@@ -838,7 +862,9 @@ class BrowserRuntime:
         self._acquire_lock()
         try:
             self.proxy = PublicNetworkProxy()
-            if self.display_mode == "xephyr":
+            if platform_runtime.platform_key() == "macos":
+                self.display = None
+            elif self.display_mode == "xephyr":
                 if not self.user_display:
                     raise RuntimeError(
                         "CW_DISPLAY_MODE=xephyr needs a user DISPLAY, but none is set"
@@ -865,6 +891,12 @@ class BrowserRuntime:
         self.browser_ws = None
         self.search_target_id = None
         self.fetch_target_id = None
+        self.gpu_info = {
+            "gpu_device": None,
+            "gpu_renderer": None,
+            "gpu_backend": "UNKNOWN",
+            "metal_active": None,
+        }
         if self.proxy is not None:
             self.proxy.close()
             self.proxy = None
@@ -954,7 +986,7 @@ class SharedSearchRateLimiter:
 
 _RUNTIME = BrowserRuntime()
 # Reap crash/kill -9 leftovers from previous sessions (dead per-pid profile
-# dirs and their orphaned Chrome/Xvfb) before this session needs a browser.
+# dirs and their orphaned Chrome/display processes) before this session needs a browser.
 BrowserRuntime._sweep_orphans()
 
 # Serialize searches within this process and reserve a shared inter-process slot.
@@ -1008,6 +1040,49 @@ async def _cdp_call(connection: Any, method: str, params: dict | None = None) ->
             if "error" in message:
                 raise RuntimeError(f"CDP {method} failed: {message['error']}")
             return message.get("result", {})
+
+
+async def _collect_gpu_info(browser: Any) -> None:
+    """Best-effort Chrome GPU diagnostics from the browser-level CDP socket."""
+    if _RUNTIME.gpu_info.get("gpu_renderer") or _RUNTIME.gpu_info.get("gpu_backend") != "UNKNOWN":
+        return
+    try:
+        result = await _cdp_call(browser, "SystemInfo.getInfo")
+        gpu = result.get("gpu", {}) if isinstance(result, dict) else {}
+        devices = gpu.get("devices", []) if isinstance(gpu, dict) else []
+        aux = gpu.get("auxAttributes", {}) if isinstance(gpu, dict) else {}
+        device = devices[0] if devices and isinstance(devices[0], dict) else {}
+        renderer = str(
+            aux.get("glRenderer")
+            or aux.get("renderer")
+            or device.get("deviceString")
+            or ""
+        ).strip()
+        vendor = str(device.get("vendorString") or aux.get("glVendor") or "").strip()
+        implementation = str(aux.get("glImplementationParts") or "").strip()
+        display_type = str(aux.get("displayType") or "").strip()
+        blob = " ".join([renderer, vendor, implementation, display_type]).lower()
+        if "swiftshader" in blob or "software" in blob:
+            backend = "SOFTWARE"
+            metal_active: bool | None = False
+        elif "metal" in blob and "angle" in blob:
+            backend = "ANGLE_METAL"
+            metal_active = True
+        elif "metal" in blob:
+            backend = "METAL"
+            metal_active = True
+        else:
+            backend = "UNKNOWN"
+            metal_active = None
+        _RUNTIME.gpu_info = {
+            "gpu_device": str(device.get("deviceString") or "").strip() or None,
+            "gpu_renderer": renderer or None,
+            "gpu_backend": backend,
+            "metal_active": metal_active,
+        }
+    except Exception:
+        # Diagnostics must never make browser/search/fetch unavailable.
+        return
 
 
 async def _evaluate(connection: Any, expression: str) -> Any:
@@ -1165,6 +1240,7 @@ async def _extract_google_candidates(
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    await _collect_gpu_info(browser)
     page: Any = None
     try:
         try:
@@ -1182,7 +1258,7 @@ async def _extract_google_candidates(
             await _cdp_call(
                 page,
                 "Page.addScriptToEvaluateOnNewDocument",
-                {"source": BrowserRuntime._STEALTH_INIT_JS},
+                {"source": BrowserRuntime._stealth_init_js()},
             )
         except Exception:
             pass
@@ -1227,10 +1303,17 @@ async def _extract_google_candidates(
 
 def _xpra_expose_enabled() -> bool:
     """Xpra auto-attach is opt-in: it once crashed the desktop session."""
+    if platform_runtime.platform_key() == "macos":
+        return False
     return os.environ.get("CW_XPRA_EXPOSE", "").strip() == "1"
 
 
 def _captcha_detail_for_mode() -> str:
+    if _RUNTIME.display_mode == "native":
+        return (
+            "Google CAPTCHA detected. Solve it in the native Chrome window "
+            "on your desktop, then retry the same search."
+        )
     if _RUNTIME.display_mode == "xephyr":
         return (
             "Google CAPTCHA detected. Solve it in the chrome-web-mcp window "
@@ -1385,6 +1468,7 @@ async def _fetch_page(url: str, char_limit: int, format: str = "text") -> dict:
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    await _collect_gpu_info(browser)
     page: Any = None
     target_id: str | None = None
     try:
@@ -1501,7 +1585,7 @@ async def list_tools() -> list[types.Tool]:
             name="google_search",
             description=(
                 "Search Google in a JavaScript-rendering Chrome browser running "
-                "non-headless inside Xvfb. Returns structured search results. "
+                "in the platform browser backend. Returns structured search results. "
                 "Workflow: first google_search, then fetch_url on interesting "
                 "result URLs for full text. Pace calls: bursts of 15+ searches "
                 "per minute raise a pace_warning and risk a Google CAPTCHA."
@@ -1535,7 +1619,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="fetch_url",
             description=(
-                "Fetch a public HTTP(S) URL with JavaScript rendering (Xvfb Chrome) "
+                "Fetch a public HTTP(S) URL with JavaScript-rendering Chrome "
                 "and return shaped readable markdown plus requested/final URLs, "
                 "redirect flag, and total_chars. The markdown is shaped "
                 "(boilerplate removed, extraction method reported); if content "
@@ -1605,11 +1689,24 @@ def _health_status() -> dict:
     except Exception:
         queue_wait_s = -1.0
     pace_count = _peek_search_count()
+    chrome_binary: str | None = None
+    chrome_version: str | None = None
+    chrome_detection_error: str | None = None
+    try:
+        chrome_binary = _RUNTIME._chrome_executable()
+        chrome_version = platform_runtime.chrome_version(chrome_binary)
+    except Exception as exc:
+        chrome_detection_error = str(exc)
     return {
+        "platform": platform_runtime.platform_description(),
         "display_mode": _RUNTIME.display_mode,
+        "chrome_binary": chrome_binary,
+        "chrome_version": chrome_version,
+        "chrome_detection_error": chrome_detection_error,
         "chrome_alive": chrome_alive,
         "xvfb_alive": xvfb_alive,
         "xephyr_alive": xephyr_alive,
+        **_RUNTIME.gpu_info,
         "rate_limiter_queue_wait_s": round(queue_wait_s, 3),
         "rate_limit_min_delay_s": _SEARCH_LIMITER.min_delay,
         "rate_limit_max_delay_s": _SEARCH_LIMITER.max_delay,
@@ -1687,7 +1784,7 @@ async def main() -> None:
         _RUNTIME.cleanup()
         # The stdio transport's writer task blocks on open pipes; os._exit is
         # the deterministic way to leave without waiting on the task group.
-        # All owned processes (Chrome, Xvfb) are already terminated above.
+        # All owned processes (Chrome and any display backend) are terminated above.
         os._exit(0)
 
     async def _on_stop(signum: int) -> None:
