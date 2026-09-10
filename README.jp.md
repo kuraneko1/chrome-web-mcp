@@ -6,24 +6,33 @@
 > 使用する場合も、ホストOSの対応条件は変わりません。
 
 > [!CAUTION]
-> 1つのMCPサーバープロセスにつき、ブラウザは1つだけ使用してください。
-> 検索は連続して大量に実行せず、基本的に順番に実行します。
+> 1つのプロファイルにつき、ブラウザは1つだけ使用してください。
 >
 > - 通常の利用ではレート制限にかかりません。1分間に15回以上の検索を
 >   開始すると`pace_warning`が返ります。
-> - `pace_warning`はブロックではありませんが、短時間に大量検索を続けると
->   GoogleからCAPTCHAを要求されることがあります。CAPTCHAが出た場合は、
->   数分待ってから再試行してください。`show_browser: true`（Xephyr）なら
->   `chrome-web-mcp`の窓でCAPTCHAを解いてから同じ検索を再試行できます。
-> - 別々のMCPプロセスは、それぞれ別のブラウザを起動します。複数のCLIや
->   MCPクライアントから同時に大量検索しないでください。
+> - `pace_warning`はブロックではありませんが、Googleは総量も見ているため、
+>   サーバー自身が絞ります。`max_searches_per_hour`（既定60回）と、
+>   CAPTCHA時の指数バックオフのクールダウンです。
+> - GoogleのCAPTCHAが出ても検索は失敗しません。Googleを共有クールダウンに
+>   入れ、同じクエリを`search_engines`の次のエンジン（既定ではDuckDuckGo、
+>   Brave、Bing、任意で自前のSearXNG）が答えます。応答の`engine`が実際に
+>   答えたエンジン、`attempts`が各エンジンの結果です。`show_browser: true`
+>   （Xephyr）ならCAPTCHAの窓は表示されたまま残るので、自分で解けます。
+>   現在の状態は`health_check`の`last_captcha_at`と`engine_cooldowns_s`で
+>   確認できます。
+> - 別々のMCPプロセスは、永続プロファイルを共有します（同時にブラウザを
+>   使えるのは1つ）。プロファイルが使用中の場合、もう一方のプロセスは自分専用の
+>   使い捨てプロファイルへ自動的に切り替えます（`health_check`の
+>   `profile_shared_fallback: true`）。同時に大量検索しないでください。
 
 JavaScriptを実行できるChromeを使って、以下のMCPツールを提供するstdio
 サーバーです。
 
-- `google_search`: Google検索を実行し、構造化された結果を返します。
+- `google_search`: Google検索を実行し、構造化された結果を返します。Googleが
+  CAPTCHAを出した場合は他のエンジンへ自動フォールバックします。
 - `fetch_url`: 公開HTTP(S)ページを取得し、読みやすいテキストやMarkdownを返します。
-- `health_check`: ブラウザ、表示モード、検索待ち時間、CAPTCHA状態を確認します。
+- `health_check`: ブラウザ、表示モード、検索待ち時間、CAPTCHA、プロファイル、
+  エンジンの状態を確認します。
 
 ## 特徴
 
@@ -32,7 +41,18 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 - `trafilatura`と`html2text`による読みやすいMarkdown整形
 - `hl`（Googleの表示言語）と`gl`（検索地域）の指定
 - 公開アドレスだけに接続する検証プロキシ。localhostやプライベートIPを拒否
-- Google検索の開始間隔をSQLiteでプロセス間共有
+- CAPTCHA耐性: GoogleがCAPTCHAを出すと次のエンジン（DuckDuckGo、Brave、
+  Bing、任意でSearXNG）が同じクエリに答えるため、1つのエンジンの失敗で
+  ツール呼び出しが失敗しません
+- 永続プロファイル: Cookieと同意状態が再起動後も残るため、Googleからは
+  「初回訪問」ではなく「再訪したブラウザ」に見えます（`"profile": "ephemeral"`
+  で従来の使い捨てプロファイルに戻せます）
+- 一貫性を優先したフィンガープリント調整: UA、`navigator.platform`、クライアント
+  ヒント、WebGLのベンダー文字列を互いに矛盾しないように揃えます（`spoof_platform`）
+- Google検索の開始間隔、CAPTCHAクールダウン、時間あたりの検索予算を
+  SQLiteでプロセス間共有
+- 既定ではGoogleの検索ボックスに入力して検索（`/search?q=`への直接遷移ではない）。
+  `"human_input": false`で直接遷移に戻せます
 - Chrome、表示サーバー、プロキシの終了処理と孤児プロセスの回収
 - Linux専用
 
@@ -135,7 +155,16 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
   "char_limit": 15000,
   "format": "markdown",
   "min_delay": 1.0,
-  "max_delay": 2.5
+  "max_delay": 2.5,
+  "profile": "persistent",
+  "search_engines": ["google", "ddg", "brave", "bing"],
+  "searxng_url": "",
+  "human_input": true,
+  "max_searches_per_hour": 60,
+  "captcha_cooldown_s": 300,
+  "captcha_cooldown_max_s": 1800,
+  "spoof_platform": "native",
+  "disable_gpu": true
 }
 ```
 
@@ -146,6 +175,22 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 - `char_limit`: `fetch_url`の既定最大文字数（100から200000）
 - `format`: `markdown`、`text`、`links`のいずれか
 - `min_delay` / `max_delay`: Google検索開始間隔の秒数。範囲内でランダム化
+- `profile`: `persistent`（既定）はCookieなどを保持する永続プロファイル、
+  `ephemeral`は従来の使い捨てプロファイル
+- `search_engines`: 試すエンジンの順序。`searxng`は`searxng_url`が必要
+- `searxng_url`: 自前のSearXNGのURL（例 `http://10.0.0.1:4000`、`format=json`許可が必要）
+- `human_input`: `true`（既定）でGoogleの検索ボックスに入力して検索
+- `max_searches_per_hour`: Googleのみの時間あたり上限（`0`で無効）
+- `captcha_cooldown_s` / `captcha_cooldown_max_s`: CAPTCHA後のクールダウン初回値と
+  指数バックオフの上限（秒）
+- `spoof_platform`: `native`（既定）はLinuxのUAと`navigator.platform`を一致させる、
+  `windows`はUA・platform・クライアントヒントをWindowsで揃える
+- `disable_gpu`: `true`（既定）でソフトウェアレンダリングを使用
+
+環境変数で上書きする場合は `CW_PROFILE_MODE`、`CW_SEARCH_ENGINES`、
+`CW_SEARXNG_URL`、`CW_HUMAN_INPUT`、`CW_MAX_SEARCHES_PER_HOUR`、
+`CW_CAPTCHA_COOLDOWN`、`CW_CAPTCHA_COOLDOWN_MAX` を使います（設定ファイルより
+優先されます）。
 
 日本語の検索結果にしたい場合は次を指定します。
 
@@ -245,13 +290,30 @@ docker build -t chrome-web-mcp /absolute/path/to/chrome-web-mcp
   "query": "検索語",
   "limit": 5,
   "hl": "ja",
-  "gl": "jp"
+  "gl": "jp",
+  "engine": "auto"
 }
 ```
 
 `query`は必須で最大512文字、`limit`は1から20です。結果にはタイトル、URL、
-説明、順位のほか、検索待ち時間`waited_ms`と`pace_warning`が含まれます。
-検索結果を詳しく読む場合は、次に`fetch_url`を使います。
+説明、順位のほか、次のフィールドが含まれます。
+
+- `engine`: 実際に答えたエンジン（`google`、`ddg`、`brave`、`bing`、`searxng`）
+- `attempts`: 試したエンジンごとの結果（`ok`と、エラーまたは結果件数）
+- `captcha_avoided`: GoogleがCAPTCHAを出し、別のエンジンが答えた場合に`true`
+- `waited_ms`: プロセス間の検索キュー待ち時間
+- `pace_warning`: 1分間に15回以上で設定されます
+
+`engine`の既定値は`auto`（設定順）です。エンジンを指定すると、そのエンジンを
+最初に試し、残りはフォールバックとして残ります。検索結果を詳しく読む場合は、
+次に`fetch_url`を使います。
+
+GoogleがCAPTCHAを表示した場合、このサーバーはCAPTCHAを突破しません。
+CAPTCHAを記録し、Googleを指数バックオフのクールダウンに入れ、同じクエリを
+次のエンジンに投げます。`show_browser: true`（Xephyr）ならCAPTCHAの窓は開いた
+まま残るので自分で解けます。すべてのエンジンが失敗した場合は
+`{"success": false, "error": "...", "attempts": [...]}`を返し、CAPTCHAが原因の
+場合は`captcha_required: true`も含まれます。
 
 ### `fetch_url`
 
@@ -276,25 +338,43 @@ docker build -t chrome-web-mcp /absolute/path/to/chrome-web-mcp
 ### `health_check`
 
 引数はありません。表示モード、Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち
-時間、直近の検索数、CAPTCHA時刻を返します。health_check自体はブラウザを起動
-しません。
+時間、直近の検索数、CAPTCHA時刻に加えて、CAPTCHA耐性の状態を返します。
+
+- `profile_mode`（`persistent`または`ephemeral`）、`profile_dir`、
+  `profile_shared_fallback`（他プロセスが共有プロファイルを使用中で、自分専用の
+  使い捨てプロファイルに切り替えた場合に`true`）
+- `engines`（試行順）、`engine_cooldowns_s`（エンジンごとの残りクールダウン秒）、
+  `searches_last_hour`、`max_searches_per_hour`、`budget_exhausted`
+- `human_input`と`spoof_platform`（現在のフィンガープリント設定）
+
+health_check自体はブラウザを起動しません。
 
 ## CAPTCHAについて
 
-このサーバーは認証やCAPTCHAを自動的に突破するものではありません。
+このサーバーは認証やCAPTCHAのパズルを自動的に解くものではありません。
 
-GoogleがCAPTCHAを表示すると、ツールは次のような結果を返します。
+GoogleがCAPTCHAを表示すると、サーバーはそれを記録してクールダウンに入り、
+同じクエリを次のエンジンで実行します。したがって通常は検索が失敗せず、
+応答は次のようになります。
 
 ```json
 {
-  "success": false,
-  "error": "...",
-  "captcha_required": true
+  "success": true,
+  "data": {
+    "engine": "ddg",
+    "captcha_avoided": true,
+    "attempts": [
+      {"engine": "google", "ok": false, "error": "captcha", "cooldown_s": 300.0},
+      {"engine": "ddg", "ok": true, "results": 5}
+    ]
+  }
 }
 ```
 
-`show_browser: true`なら、デスクトップ上の`chrome-web-mcp`窓でCAPTCHAを解き、
-同じ検索を再試行します。`false`なら数分待ってから再試行してください。
+`show_browser: true`（Xephyr）ならCAPTCHAの窓は表示されたまま残ります。窓で
+CAPTCHAを解いてから同じ検索を再試行すると、次にGoogleが成功した時点で
+クールダウンが解除されます。`show_browser: false`（Xvfb）の場合は、Googleが
+クールダウン中は他のエンジンが答えます。
 
 ## セキュリティと範囲
 

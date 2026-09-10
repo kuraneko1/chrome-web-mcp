@@ -28,6 +28,15 @@ def test_full_override(monkeypatch, tmp_path):
         "format": "text",
         "min_delay": 2.0,
         "max_delay": 4.0,
+        "profile": "ephemeral",
+        "search_engines": ["ddg", "brave"],
+        "searxng_url": "http://10.0.0.1:4000/",
+        "human_input": False,
+        "max_searches_per_hour": 10,
+        "captcha_cooldown_s": 60,
+        "captcha_cooldown_max_s": 600,
+        "spoof_platform": "windows",
+        "disable_gpu": False,
     })
     monkeypatch.setenv("CW_CONFIG", path)
     cfg = server._load_config()
@@ -40,6 +49,15 @@ def test_full_override(monkeypatch, tmp_path):
         "format": "text",
         "min_delay": 2.0,
         "max_delay": 4.0,
+        "profile": "ephemeral",
+        "search_engines": ["ddg", "brave"],
+        "searxng_url": "http://10.0.0.1:4000",
+        "human_input": False,
+        "max_searches_per_hour": 10,
+        "captcha_cooldown_s": 60.0,
+        "captcha_cooldown_max_s": 600.0,
+        "spoof_platform": "windows",
+        "disable_gpu": False,
     }
 
 
@@ -53,6 +71,15 @@ def test_bad_values_fall_back_per_key(monkeypatch, tmp_path, capsys):
         "min_delay": 5.0,
         "max_delay": 1.0,
         "bogus_key": 1,
+        "profile": "sometimes",
+        "search_engines": "google",
+        "searxng_url": "ftp://nope",
+        "human_input": "yes",
+        "max_searches_per_hour": -1,
+        "captcha_cooldown_s": 900,
+        "captcha_cooldown_max_s": 60,
+        "spoof_platform": "mac",
+        "disable_gpu": "no",
     })
     monkeypatch.setenv("CW_CONFIG", path)
     cfg = server._load_config()

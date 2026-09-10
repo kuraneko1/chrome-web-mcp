@@ -31,19 +31,83 @@ SPEC.loader.exec_module(server)
 BrowserRuntime = server.BrowserRuntime
 
 
-def test_per_session_profile_default_uses_pid():
-    # Without CW_PROFILE_DIR/CW_LOCK_PATH the default profile dir must be per-pid.
+def test_default_profile_is_persistent_and_ephemeral_is_opt_in():
+    """The default profile is a warm shared one; CW_PROFILE_MODE=ephemeral opts out."""
     saved = {k: os.environ.pop(k) for k in ("CW_PROFILE_DIR", "CW_LOCK_PATH") if k in os.environ}
-    try:
+    saved_mode = os.environ.pop("CW_PROFILE_MODE", None)
+
+    def fresh_server():
         spec = importlib.util.spec_from_file_location(
             "chrome_web_server_fresh", SERVER_PY
         )
-        fresh = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(fresh)
+        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        return module
+
+    try:
+        fresh = fresh_server()
+        assert fresh._PROFILE_EPHEMERAL is False
+        assert str(fresh.PROFILE_DIR).endswith("chrome-web-mcp/profile")
+        assert str(os.getpid()) not in str(fresh.PROFILE_DIR)
+        assert fresh.LOCK_PATH == fresh.PROFILE_DIR / ".instance.lock"
+
+        os.environ["CW_PROFILE_MODE"] = "ephemeral"
+        fresh = fresh_server()
+        assert fresh._PROFILE_EPHEMERAL is True
         assert str(os.getpid()) in str(fresh.PROFILE_DIR)
         assert fresh.LOCK_PATH == fresh.PROFILE_DIR / ".instance.lock"
     finally:
         os.environ.update(saved)
+        os.environ.pop("CW_PROFILE_MODE", None)
+        if saved_mode is not None:
+            os.environ["CW_PROFILE_MODE"] = saved_mode
+
+
+def test_explicit_profile_dir_wins_over_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("CW_PROFILE_MODE", "ephemeral")
+    monkeypatch.setattr(server, "_PROFILE_EPHEMERAL", False)
+    server._init_profile()
+    try:
+        assert server.PROFILE_DIR == Path(os.environ["CW_PROFILE_DIR"]).expanduser()
+        assert server._PROFILE_EPHEMERAL is False
+    finally:
+        server._init_profile()
+
+
+def test_busy_shared_profile_falls_back_to_ephemeral(monkeypatch, tmp_path):
+    """A live sibling holds the shared profile: this process must not fail."""
+    monkeypatch.setattr(server, "_activate_profile", server._activate_profile)
+    monkeypatch.setattr(server, "_PROFILE_EPHEMERAL", False)
+    monkeypatch.setattr(server, "_PROFILE_FELL_BACK", False)
+    monkeypatch.delenv("CW_PROFILE_DIR", raising=False)
+    monkeypatch.delenv("CW_LOCK_PATH", raising=False)
+    shared = tmp_path / "shared"
+    server._activate_profile(shared, ephemeral=False)
+
+    holder = (shared / ".instance.lock")
+    holder.parent.mkdir(parents=True, exist_ok=True)
+    held = holder.open("a+")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert server._can_fall_back_to_ephemeral() is True
+        server._fall_back_to_ephemeral_profile()
+        assert server._PROFILE_FELL_BACK is True
+        assert server._PROFILE_EPHEMERAL is True
+        assert str(os.getpid()) in str(server.PROFILE_DIR)
+    finally:
+        held.close()
+        server._init_profile()
+        setattr(server, "_PROFILE_FELL_BACK", False)
+
+
+def test_no_fallback_when_profile_dir_is_explicit(monkeypatch, tmp_path):
+    """An explicit CW_PROFILE_DIR/CW_LOCK_PATH is never silently swapped out."""
+    monkeypatch.setenv("CW_PROFILE_DIR", str(tmp_path / "explicit"))
+    server._activate_profile(tmp_path / "explicit", ephemeral=False)
+    try:
+        assert server._can_fall_back_to_ephemeral() is False
+    finally:
+        server._init_profile()
 
 
 def test_live_holder_yields_diagnostic_error(tmp_path, monkeypatch):
@@ -166,14 +230,29 @@ def test_sweep_recovers_recorded_display_and_browser(tmp_path, monkeypatch):
                 child.wait(timeout=5)
 
 
-def test_cleanup_removes_owned_default_profile(tmp_path, monkeypatch):
+def test_cleanup_removes_owned_ephemeral_profile(tmp_path, monkeypatch):
     profile = tmp_path / "default-profile"
     monkeypatch.delenv("CW_PROFILE_DIR", raising=False)
     monkeypatch.setattr(server, "PROFILE_DIR", profile)
     monkeypatch.setattr(server, "LOCK_PATH", profile / ".instance.lock")
     monkeypatch.setattr(server, "DEVTOOLS_FILE", profile / "DevToolsActivePort")
+    monkeypatch.setattr(server, "_PROFILE_EPHEMERAL", True)
     runtime = BrowserRuntime()
     runtime._acquire_lock()
     (profile / "fixture").write_text("temporary profile")
     runtime.cleanup()
     assert not profile.exists()
+
+
+def test_cleanup_keeps_persistent_profile(tmp_path, monkeypatch):
+    """A persistent profile must survive cleanup: that is the whole point of it."""
+    profile = tmp_path / "persistent-profile"
+    monkeypatch.setattr(server, "PROFILE_DIR", profile)
+    monkeypatch.setattr(server, "LOCK_PATH", profile / ".instance.lock")
+    monkeypatch.setattr(server, "DEVTOOLS_FILE", profile / "DevToolsActivePort")
+    monkeypatch.setattr(server, "_PROFILE_EPHEMERAL", False)
+    runtime = BrowserRuntime()
+    runtime._acquire_lock()
+    (profile / "Cookies").write_text("session state")
+    runtime.cleanup()
+    assert (profile / "Cookies").read_text() == "session state"

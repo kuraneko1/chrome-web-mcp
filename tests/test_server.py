@@ -106,15 +106,24 @@ def test_human_display_environment_prefers_explicit_xauthority(tmp_path, monkeyp
     assert env["XAUTHORITY"] == str(explicit)
 
 
-def test_captcha_error_is_marked_for_the_mcp_client(monkeypatch):
-    async def fake_search(query, limit, hl="ja", gl="jp"):
+def test_captcha_error_is_marked_for_the_mcp_client(monkeypatch, tmp_path):
+    """Google-only config: a CAPTCHA still surfaces captcha_required=True."""
+    async def fake_google(query, limit, hl="ja", gl="jp"):
         raise server.CaptchaRequired("Google CAPTCHA detected")
 
-    monkeypatch.setattr(server, "_search_google", fake_search)
+    monkeypatch.setattr(server, "_extract_google_candidates", fake_google)
+    monkeypatch.setattr(server, "_ENGINE_STATE", server.SearchEngineState(tmp_path / "state.sqlite3"))
+    monkeypatch.setitem(server.CONFIG, "search_engines", ["google"])
     content = run_async(_call_tool("google_search", {"query": "test", "limit": 1}))
     payload = json.loads(content[0].text)
 
-    assert payload == {"success": False, "error": "Google CAPTCHA detected", "captcha_required": True}
+    assert payload["success"] is False
+    assert payload["captcha_required"] is True
+    assert "captcha" in payload["error"].lower()
+    assert payload["attempts"] == [
+        {"engine": "google", "ok": False, "error": "captcha",
+         "cooldown_s": 300.0, "detail": "Google CAPTCHA detected"}
+    ]
 
 
 def test_expose_for_human_starts_shadow_and_attach(monkeypatch):
@@ -195,19 +204,29 @@ def test_rejects_non_public_or_secret_result_urls(url):
         server._validate_public_url(url)
 
 
-def test_call_tool_returns_single_structured_json_layer(monkeypatch):
-    async def fake_search(query, limit, hl="ja", gl="jp"):
+def test_call_tool_returns_single_structured_json_layer(monkeypatch, tmp_path):
+    async def fake_google(query, limit, hl="ja", gl="jp"):
         assert query == "Hermes Agent"
         assert limit == 2
-        return [{"title": "Hermes", "url": "https://example.com/", "description": "Agent", "position": 1}], 0.0, None
+        return [{"title": "Hermes", "href": "https://example.com/", "description": "Agent"}]
 
-    monkeypatch.setattr(server, "_search_google", fake_search)
+    async def fake_resolve(href):
+        return href
+
+    monkeypatch.setattr(server, "_extract_google_candidates", fake_google)
+    monkeypatch.setattr(server, "_resolve_candidate_url", fake_resolve)
+    monkeypatch.setattr(server, "_ENGINE_STATE", server.SearchEngineState(tmp_path / "state.sqlite3"))
+    monkeypatch.setitem(server.CONFIG, "search_engines", ["google"])
     content = run_async(_call_tool("google_search", {"query": "Hermes Agent", "limit": 2}))
     payload = json.loads(content[0].text)
-    assert payload == {
-        "success": True,
-        "data": {"web": [{"title": "Hermes", "url": "https://example.com/", "description": "Agent", "position": 1}], "waited_ms": 0, "pace_warning": None},
-    }
+    assert payload["success"] is True
+    assert payload["data"]["web"] == [
+        {"title": "Hermes", "url": "https://example.com/", "description": "Agent", "position": 1}
+    ]
+    assert payload["data"]["engine"] == "google"
+    assert payload["data"]["captcha_avoided"] is False
+    assert payload["data"]["waited_ms"] >= 0
+    assert payload["data"]["attempts"] == [{"engine": "google", "ok": True, "results": 1}]
 
 
 def test_build_results_deduplicates_and_honors_limit():
@@ -327,8 +346,13 @@ def test_show_browser_false_selects_xvfb(monkeypatch):
     assert server.BrowserRuntime().display_mode == "xvfb"
 
 
-def test_xephyr_mode_requires_user_display(monkeypatch):
+def test_xephyr_mode_requires_user_display(monkeypatch, tmp_path):
     monkeypatch.setenv("CW_DISPLAY_MODE", "xephyr")
+    # Keep the profile lock inside tmp_path so the display check is what fails,
+    # not contention with another runtime in this test session.
+    monkeypatch.setattr(server, "PROFILE_DIR", tmp_path / "profile")
+    monkeypatch.setattr(server, "LOCK_PATH", tmp_path / "profile" / ".instance.lock")
+    monkeypatch.setattr(server, "DEVTOOLS_FILE", tmp_path / "profile" / "DevToolsActivePort")
     runtime = server.BrowserRuntime()
     runtime.user_display = None
     try:

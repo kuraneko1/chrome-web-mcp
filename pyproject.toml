@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chrome-web-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Safe JavaScript-rendered Google search and public URL fetch MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,7 @@ dependencies = [
   "websockets==16.0",
   "trafilatura>=2.2.0",
   "html2text>=2025.4.15",
+  "lxml>=5.2",
 ]
 
 [project.scripts]
