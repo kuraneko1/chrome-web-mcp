@@ -6,6 +6,7 @@ these tests never start a browser and never sleep.
 
 import asyncio
 import json
+import shutil
 import time
 
 import pytest
@@ -235,3 +236,45 @@ def test_health_check_reflects_idle_release_overrides(monkeypatch):
     monkeypatch.setitem(server.CONFIG, "idle_release_s", 45)
     monkeypatch.delenv("CW_IDLE_RELEASE")
     assert health_data()["idle_release_s"] == 45.0
+
+
+def browser_available() -> bool:
+    if server.platform_runtime.platform_key() == "linux" and not shutil.which("Xvfb"):
+        return False
+    try:
+        return bool(server.BrowserRuntime._chrome_executable())
+    except Exception:
+        return False
+
+
+@pytest.mark.live
+def test_idle_release_reaps_and_restarts_a_real_browser(monkeypatch):
+    """End-to-end: a real Chrome is released and the next call restarts it.
+
+    Runs only with ``-m live`` and skips cleanly when Xvfb/Chrome are missing.
+    """
+    if not browser_available():
+        pytest.skip("Xvfb/Chrome not available")
+    monkeypatch.setenv("CW_DISPLAY_MODE", "xvfb")
+    runtime = server.BrowserRuntime()
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    try:
+        runtime.ensure()
+    except Exception as exc:  # pragma: no cover - environment dependent
+        runtime.cleanup()
+        pytest.skip(f"browser could not start: {exc}")
+    try:
+        assert runtime.chrome is not None and runtime.chrome.poll() is None
+        runtime.last_used = time.monotonic() - 10.0
+
+        # One reaper tick frees the browser tree (the decision is exercised with
+        # a back-dated clock instead of sleeping).
+        assert server._reaper_tick(1.0) is True
+        assert runtime.chrome is None
+        assert runtime.browser_releases == 1
+
+        # The next tool call transparently starts a fresh browser.
+        runtime.ensure()
+        assert runtime.chrome is not None and runtime.chrome.poll() is None
+    finally:
+        runtime.cleanup()

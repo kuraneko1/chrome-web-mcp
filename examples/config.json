@@ -15,5 +15,6 @@
   "captcha_cooldown_s": 300,
   "captcha_cooldown_max_s": 1800,
   "spoof_platform": "native",
-  "disable_gpu": true
+  "disable_gpu": true,
+  "idle_release_s": 300
 }
