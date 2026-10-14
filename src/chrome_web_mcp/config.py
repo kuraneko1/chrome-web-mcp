@@ -49,6 +49,10 @@ _CONFIG_DEFAULTS = {
     # Keep Chrome's software rendering (stable on headless/CI hosts). Turn off
     # to let Chrome use the host GPU.
     "disable_gpu": True,
+    # Release the browser (Chrome + display backend) after this many seconds
+    # without a browser tool call, freeing ~600 MB; the next call starts it
+    # again (~0.9 s). 0 disables idle release.
+    "idle_release_s": 300,
 }
 
 
@@ -192,4 +196,10 @@ def _load_config() -> dict:
             cfg.update(cooldowns)
         else:
             _warn_config("captcha_cooldown_max_s must be >= captcha_cooldown_s; using defaults")
+    if "idle_release_s" in data:
+        value = data["idle_release_s"]
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            cfg["idle_release_s"] = float(value)
+        else:
+            _warn_config("idle_release_s must be a non-negative number; using default")
     return cfg

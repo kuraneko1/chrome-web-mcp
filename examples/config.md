@@ -163,13 +163,35 @@ search clears the cooldown.
   usable GPU path Chrome may expose no WebGL context either way; the WebGL
   vendor/renderer strings are normalized when WebGL is available.
 
+## Idle release
+
+### `idle_release_s`
+
+Seconds without a browser tool call (`google_search` / `fetch_url`) before the
+server releases its Chrome + display backend, freeing the browser tree's memory
+while the MCP server process keeps running. The next tool call starts the
+browser again transparently.
+
+- Default `300` (five minutes).
+- `0` disables idle release and restores the pre-idle-release behavior (the
+  browser stays up for the whole server session).
+- Any non-negative number of seconds is accepted; non-numeric or negative
+  values warn on stderr and keep the default.
+
+Measured on a Debian host (Chrome 155 + Xvfb): the released browser tree is
+about **600 MB** RSS (Chrome, renderers, GPU, network, Xvfb), a cold start
+(Xvfb + Chrome until CDP is ready) takes **0.88 s**, and cleanup takes
+**0.62 s**. So an idle release costs roughly 0.9 s on the next call and gives
+the ~600 MB back in the meantime. The persistent profile is never deleted by
+idle release — only the throwaway ephemeral profile is removed, on exit.
+
 ## Precedence and restart
 
 When the same setting is specified more than once, the order is:
 
 1. Tool-call argument
-2. Environment variable (`CW_DISPLAY_MODE`, `CW_MIN_DELAY`, or
-   `CW_MAX_DELAY`)
+2. Environment variable (`CW_DISPLAY_MODE`, `CW_MIN_DELAY`, `CW_MAX_DELAY`, or
+   `CW_IDLE_RELEASE`)
 3. `config.json`
 4. Built-in default
 

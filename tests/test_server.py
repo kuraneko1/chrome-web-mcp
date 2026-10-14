@@ -853,6 +853,35 @@ def test_call_tool_fetch_url_rejects_bad_format():
     assert "format" in payload["error"]
 
 
+def test_call_tool_tracks_browser_calls_for_idle_release(monkeypatch):
+    runtime = server.BrowserRuntime()
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    seen = {}
+
+    async def fake_fetch(url, char_limit, format="markdown"):
+        seen["active_calls"] = runtime.active_calls
+        return {"url": url, "title": "t", "text": "x", "truncated": False}
+
+    monkeypatch.setattr(server, "_fetch_page", fake_fetch)
+    run_async(_call_tool("fetch_url", {"url": "https://example.com"}))
+
+    assert seen["active_calls"] == 1
+    assert runtime.active_calls == 0
+    assert runtime.last_used is not None
+
+
+def test_health_check_does_not_count_as_browser_use(monkeypatch):
+    runtime = server.BrowserRuntime()
+    runtime.last_used = 123.0
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(server, "_LAST_CAPTCHA_TS", None)
+
+    run_async(_call_tool("health_check", {}))
+
+    assert runtime.active_calls == 0
+    assert runtime.last_used == 123.0
+
+
 def test_health_check_reports_status(monkeypatch):
     monkeypatch.setattr(server, "_LAST_CAPTCHA_TS", None)
     monkeypatch.setattr(server, "CONFIG", dict(server._CONFIG_DEFAULTS))
