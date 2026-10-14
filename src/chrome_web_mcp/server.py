@@ -6,6 +6,18 @@ native/headless Chrome on macOS), renders pages with JavaScript through CDP, and
 exposes a stateless Google search tool plus a public-URL fetch tool. Fetch
 targets and their post-redirect final URLs are validated fail-closed; arbitrary
 page-context JavaScript is never exposed.
+
+Module map (this module keeps the browser runtime, profile/lock management,
+search and fallback orchestration, the MCP tool surface, health reporting and
+main/run, and re-exports the names tests patch on ``chrome_web_mcp.server``):
+  * config.py    - config defaults and optional JSON config-file loading
+  * state.py     - shared rate limiter, engine cooldowns/budget, env helpers
+  * urlpolicy.py - secret/host checks, public-URL validation, href normalization
+  * cdp.py       - CDP request framing, JS evaluation, page snapshots
+  * extract.py   - in-page extraction JavaScript, shaped markdown, smart cuts
+  * results.py   - engine candidate normalization and result shaping
+  * errors.py    - CaptchaRequired and SearchFailed
+  * processes.py - owned-process identity and teardown
 """
 
 from __future__ import annotations
