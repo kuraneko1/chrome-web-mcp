@@ -33,6 +33,11 @@ jobs:
           CW_DISPLAY_MODE: xvfb
           TMPDIR: ${{ runner.temp }}
         run: python -m pytest -q -m 'not live'
+      - name: TEMP diagnose xauth Chrome launch
+        if: always()
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: python tests/_xauth_probe.py
       - name: Build wheel and source distribution
         run: python -m build
 
