@@ -80,7 +80,7 @@ from chrome_web_mcp.processes import _process_identity, _terminate_owned_process
 # Re-exported: the search orchestrators below call these with _resolve_candidate_url.
 from chrome_web_mcp.results import _build_results, _normalize_candidates
 # Re-exported for tests; the instances below stay here (patch targets).
-from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag
+from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag, _env_float
 # Re-exported: _resolve_candidate_url (kept here) and tests call these.
 from chrome_web_mcp.urlpolicy import (
     _is_google_challenge,
@@ -1096,6 +1096,15 @@ def _human_input_enabled() -> bool:
     return _env_flag("CW_HUMAN_INPUT", bool(CONFIG["human_input"]))
 
 
+def _idle_release_s() -> float:
+    """Idle-release timeout in seconds: CW_IDLE_RELEASE wins over config.
+
+    Like the other numeric env overrides, a non-numeric value falls back to the
+    config/default and a negative one is clamped to 0 (disabled).
+    """
+    return max(0.0, _env_float("CW_IDLE_RELEASE", float(CONFIG["idle_release_s"])))
+
+
 def _engine_skip_reason(engine: str) -> str | None:
     """Why an engine should be skipped right now, or None to try it.
 
@@ -1738,6 +1747,29 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         if tracks_browser:
             _RUNTIME.active_calls = max(0, _RUNTIME.active_calls - 1)
     return [types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+
+def _release_if_idle(runtime: Any, now: float, idle_s: float) -> bool:
+    """Release ``runtime``'s browser when it has been idle for ``idle_s``.
+
+    Dependency-free decision logic so tests can drive it with a fake runtime
+    and clock. Returns True only when a live browser was torn down: a disabled
+    timeout (``idle_s <= 0``), a runtime with a tool call in flight
+    (``active_calls > 0``), a runtime that never used a browser, and one whose
+    Chrome has already exited are all left alone. ``cleanup()`` keeps the
+    persistent profile (it only removes throwaway profiles).
+    """
+    if idle_s <= 0 or runtime.active_calls > 0:
+        return False
+    last_used = runtime.last_used
+    if last_used is None or now - last_used < idle_s:
+        return False
+    chrome = runtime.chrome
+    if chrome is None or chrome.poll() is not None:
+        return False
+    runtime.cleanup()
+    runtime.browser_releases += 1
+    return True
 
 
 async def main() -> None:
