@@ -32,6 +32,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -119,9 +120,46 @@ _PROFILE_FELL_BACK = False
 _PROFILE_LOCK_OVERRIDDEN = False
 
 
+def _ensure_private_dir(path: Path) -> None:
+    """Create ``path`` atomically with mode 0700, or verify it is already private.
+
+    ``os.mkdir`` is atomic, so a local user cannot win a race to pre-create the
+    directory; a pre-existing directory is only accepted when it is a real
+    directory owned by this user with no group/world access. ``lstat`` is used
+    so a symlink is refused instead of followed (F7).
+    """
+    try:
+        os.mkdir(path, 0o700)
+        return
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"cannot create the private directory {path}: {exc}") from exc
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect the private directory {path}: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError(
+            f"refusing to use {path}: it is not a private directory owned by this "
+            f"user (mode {info.st_mode & 0o777:03o}); another local user may have "
+            "planted it"
+        )
+
+
 def _ephemeral_profile_dir() -> Path:
-    """Throwaway per-process profile (the pre-0.3.0 default)."""
-    return Path(tempfile.gettempdir()) / "chrome-web-v2-profile" / str(os.getpid())
+    """Throwaway per-process profile under a per-user private base.
+
+    The base and the per-pid leaf are created atomically with 0700, and a
+    pre-existing one that is not ours or is group/world-writable is refused: a
+    shared /tmp parent would otherwise let another local user replace the
+    profile Chrome then trusts (F7).
+    """
+    base = Path(tempfile.gettempdir()) / "chrome-web-v2-profile"
+    _ensure_private_dir(base)
+    leaf = base / str(os.getpid())
+    _ensure_private_dir(leaf)
+    return leaf
 
 
 def _persistent_profile_dir() -> Path:

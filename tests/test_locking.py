@@ -172,6 +172,55 @@ def test_dead_holder_lock_is_reacquired(tmp_path, monkeypatch):
         rt.cleanup()
 
 
+def test_ephemeral_profile_is_created_atomically_0700(tmp_path, monkeypatch):
+    """F7: the throwaway profile must be private from the moment it exists."""
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    path = server._ephemeral_profile_dir()
+
+    assert path == tmp_path / "chrome-web-v2-profile" / str(os.getpid())
+    assert (path.stat().st_mode & 0o777) == 0o700
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
+    # A stale directory from an earlier run of this pid is ours and is reused.
+    assert server._ephemeral_profile_dir() == path
+
+
+def test_ephemeral_profile_refuses_an_open_or_foreign_base(tmp_path, monkeypatch):
+    """F7: a pre-created shared-/tmp parent must never be used."""
+    base = tmp_path / "chrome-web-v2-profile"
+    base.mkdir()
+    os.chmod(base, 0o777)
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="refusing"):
+        server._ephemeral_profile_dir()
+
+
+def test_ephemeral_profile_refuses_a_symlinked_base(tmp_path, monkeypatch):
+    """F7: a symlinked parent is refused, never followed."""
+    target = tmp_path / "attacker"
+    target.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "chrome-web-v2-profile").symlink_to(target)
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(root))
+
+    with pytest.raises(RuntimeError, match="refusing"):
+        server._ephemeral_profile_dir()
+
+
+def test_ephemeral_profile_refuses_a_precreated_pid_directory(tmp_path, monkeypatch):
+    """F7: the per-pid leaf is the actual profile; it must not be pre-planted."""
+    base = tmp_path / "chrome-web-v2-profile"
+    leaf = base / str(os.getpid())
+    leaf.mkdir(parents=True)
+    os.chmod(leaf, 0o777)
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="refusing"):
+        server._ephemeral_profile_dir()
+
+
 def test_sweep_orphans_removes_dead_keeps_alive(tmp_path, monkeypatch):
     base = tmp_path / "chrome-web-v2-profile"
     base.mkdir()
