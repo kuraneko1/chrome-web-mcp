@@ -43,6 +43,16 @@ from chrome_web_mcp import platform_runtime
 from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
 # Re-exported: callers and tests catch these as attributes of this module.
 from chrome_web_mcp.errors import CaptchaRequired, SearchFailed
+# Re-exported: _read_page_string/_fetch_page (kept here) and tests use these.
+from chrome_web_mcp.extract import (
+    MAX_EXTRACTION_CHARS,
+    _EXTRACT_RESULTS_JS,
+    _FETCH_LINKS_JS,
+    _FETCH_MD_JS,
+    _FETCH_TEXT_JS,
+    _shape_markdown,
+    _smart_cut,
+)
 # Re-exported for tests; _stop_recorded_process (kept here) calls _process_identity.
 from chrome_web_mcp.processes import _process_identity, _terminate_owned_process
 # Re-exported for tests; the instances below stay here (patch targets).
@@ -54,15 +64,6 @@ from chrome_web_mcp.urlpolicy import (
     _normalize_candidate_href,
     _validate_public_url,
 )
-
-try:
-    import trafilatura
-except ImportError:  # pragma: no cover - dependency declared in pyproject
-    trafilatura = None  # type: ignore[assignment]
-try:
-    import html2text
-except ImportError:  # pragma: no cover - dependency declared in pyproject
-    html2text = None  # type: ignore[assignment]
 
 HERE = Path(__file__).resolve().parent
 
@@ -114,7 +115,6 @@ def _activate_profile(path: Path, *, ephemeral: bool) -> None:
     DEVTOOLS_FILE = PROFILE_DIR / "DevToolsActivePort"
     _PROFILE_EPHEMERAL = ephemeral
 MAX_CDP_MESSAGE = 2 * 1024 * 1024
-MAX_EXTRACTION_CHARS = 16 * 1024 * 1024
 
 app = Server("chrome-web")
 
@@ -851,10 +851,6 @@ class BrowserRuntime:
                 self.lock_file = None
 
 
-
-
-
-
 _RUNTIME = BrowserRuntime()
 # Reap crash/kill -9 leftovers from previous sessions (dead per-pid profile
 # dirs and their orphaned Chrome/display processes) before this session needs a browser.
@@ -1247,8 +1243,6 @@ async def _searxng_candidates(query: str, limit: int, hl: str) -> list[dict]:
     return engines.parse_searxng(payload, max(limit * 2, limit))
 
 
-
-
 def _searxng_url() -> str:
     """SearXNG base URL: CW_SEARXNG_URL wins over the config file."""
     raw = os.environ.get("CW_SEARXNG_URL", "").strip()
@@ -1301,25 +1295,6 @@ def _engine_order(requested: str = "auto") -> list[str]:
         )
     # A pinned engine is tried first, then the rest as fallback.
     return [wanted] + [name for name in configured if name != wanted]
-
-
-_EXTRACT_RESULTS_JS = r"""(() => {
-  const clean = value => (value || '').replace(/\s+/g, ' ').trim();
-  const output = [];
-  for (const anchor of document.querySelectorAll('a[href]')) {
-    const heading = anchor.querySelector('h3');
-    if (!heading) continue;
-    const title = clean(heading.innerText || heading.textContent);
-    if (!title) continue;
-    const block = anchor.closest('[data-hveid]') || anchor.parentElement?.parentElement || anchor.parentElement;
-    const blockText = clean(block?.innerText || '');
-    let description = blockText;
-    if (description.startsWith(title)) description = clean(description.slice(title.length));
-    output.push({title, href: anchor.href || '', description: description.slice(0, 1000)});
-    if (output.length >= 40) break;
-  }
-  return JSON.stringify(output);
-})()"""
 
 
 async def _ensure_reused_tab(browser: Any, which: str) -> Any:
@@ -1582,117 +1557,6 @@ async def _search_with_fallback(
         "attempts": attempts,
         "captcha_avoided": captcha_seen,
     }
-
-
-# Extract clean, readable text from a rendered page (no scripts/styles/nav).
-_FETCH_TEXT_JS = r"""(() => {
-  const clone = document.body ? document.body.cloneNode(true) : document;
-  for (const sel of ['script','style','noscript','svg','canvas','iframe','nav','footer','header','[aria-hidden="true"]']) {
-    clone.querySelectorAll(sel).forEach(el => el.remove());
-  }
-  const title = (document.title || '').trim();
-  const text = (clone.innerText || '').replace(/ /g, ' ');
-  return JSON.stringify({title, text});
-})()"""
-
-
-# Extract lightweight markdown (headings/paragraphs/lists) plus page links.
-_FETCH_MD_JS = r"""(() => {
-  const clean = v => (v || '').replace(/\s+/g, ' ').trim();
-  const title = (document.title || '').trim();
-  const links = [];
-  for (const a of document.querySelectorAll('a[href]')) {
-    const t = clean(a.innerText || a.textContent);
-    let h = '';
-    try { h = new URL(a.href, location.href).href; } catch (e) { continue; }
-    if (!/^https?:\/\//i.test(h)) continue;
-    if (t) links.push({text: t.slice(0, 200), url: h});
-    if (links.length >= 200) break;
-  }
-  const parts = [];
-  for (const el of document.querySelectorAll('h1,h2,h3,p,li,pre')) {
-    if (!el.isConnected) continue;
-    const t = clean(el.innerText || el.textContent);
-    if (!t) continue;
-    const tag = el.tagName;
-    if (tag === 'H1') parts.push('# ' + t);
-    else if (tag === 'H2') parts.push('## ' + t);
-    else if (tag === 'H3') parts.push('### ' + t);
-    else if (tag === 'LI') parts.push('- ' + t);
-    else if (tag === 'PRE') parts.push('```\n' + t.slice(0, 2000) + '\n```');
-    else parts.push(t);
-    if (parts.join('\n\n').length > 300000) break;
-  }
-  let markdown = parts.join('\n\n');
-  if (!markdown) markdown = clean(document.body ? document.body.innerText : '');
-  return JSON.stringify({title, markdown, links});
-})()"""
-
-
-# Page links as follow-up crawl targets (used with shaped markdown).
-_FETCH_LINKS_JS = r"""(() => {
-  const clean = v => (v || '').replace(/\s+/g, ' ').trim();
-  const out = [];
-  for (const a of document.querySelectorAll('a[href]')) {
-    const t = clean(a.innerText || a.textContent);
-    let h = '';
-    try { h = new URL(a.href, location.href).href; } catch (e) { continue; }
-    if (!/^https?:\/\//i.test(h)) continue;
-    if (t) out.push({text: t.slice(0, 200), url: h});
-    if (out.length >= 200) break;
-  }
-  return JSON.stringify(out);
-})()"""
-
-
-def _shape_markdown(html: str, url: str) -> tuple[str, str]:
-    """Shape rendered HTML into boilerplate-free markdown.
-
-    Returns (markdown, extraction): trafilatura first, html2text fallback,
-    dom-walk last resort. An empty markdown with extraction "none" means the
-    shaper saw nothing usable (caller: retry with format "text").
-    """
-    if trafilatura is not None:
-        try:
-            shaped = trafilatura.extract(
-                html,
-                output_format="markdown",
-                include_links=True,
-                include_images=False,
-                url=url,
-                deduplicate=True,
-            )
-        except Exception:
-            shaped = None
-        if shaped and len(shaped.strip()) > 200:
-            return shaped.strip(), "trafilatura"
-    if html2text is not None:
-        try:
-            conv = html2text.HTML2Text()
-            conv.body_width = 0
-            conv.ignore_images = True
-            shaped = conv.handle(html)
-        except Exception:
-            shaped = None
-        if shaped and shaped.strip():
-            return shaped.strip(), "html2text"
-    return "", "none"
-
-
-def _smart_cut(text: str, limit: int) -> tuple[str, bool]:
-    """Cut text at a sentence/word boundary; return (cut, truncated)."""
-    if len(text) <= limit:
-        return text, False
-    window = text[:limit]
-    boundary = -1
-    for match in re.finditer(r"[。.!?！？]", window):
-        boundary = match.end()
-    if boundary > limit * 0.5:
-        return window[:boundary].rstrip(), True
-    space = window.rfind(" ")
-    if space > limit * 0.5:
-        return window[:space], True
-    return window, True
 
 
 async def _fetch_page(url: str, char_limit: int, format: str = "text") -> dict:
