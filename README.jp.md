@@ -2,8 +2,10 @@
 
 [English README](README.md)
 
-> **対応OS: Linuxのみ。** WindowsとmacOSはサポート対象外です。Dockerを
-> 使用する場合も、ホストOSの対応条件は変わりません。
+> **対応OS: Linux / macOS。** macOSではX11を使わず、通常のMac版Chromeを
+> visibleまたは`--headless=new`で起動します。Windowsは未対応です。
+> macOSのセットアップとプロジェクト内Chrome for Testingについては
+> [docs/macos.md](docs/macos.md)を参照してください。
 
 > [!CAUTION]
 > 1つのプロファイルにつき、ブラウザは1つだけ使用してください。
@@ -19,7 +21,8 @@
 >   答えたエンジン、`attempts`が各エンジンの結果です。`show_browser: true`
 >   （Xephyr）ならCAPTCHAの窓は表示されたまま残るので、自分で解けます。
 >   現在の状態は`health_check`の`last_captcha_at`と`engine_cooldowns_s`で
->   確認できます。
+>   確認できます。全エンジンがクールダウン中の場合は、数分待ってから再試行して
+>   ください。
 > - 別々のMCPプロセスは、永続プロファイルを共有します（同時にブラウザを
 >   使えるのは1つ）。プロファイルが使用中の場合、もう一方のプロセスは自分専用の
 >   使い捨てプロファイルへ自動的に切り替えます（`health_check`の
@@ -37,7 +40,7 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 ## 特徴
 
 - 実際のChrome/Chromiumを使ったJavaScript対応のGoogle検索とページ取得
-- Xephyr（窓あり）またはXvfb（窓なし）による独立した仮想ディスプレイ
+- LinuxではXephyr/Xvfb、macOSではnative/headless Chromeを使用
 - `trafilatura`と`html2text`による読みやすいMarkdown整形
 - `hl`（Googleの表示言語）と`gl`（検索地域）の指定
 - 公開アドレスだけに接続する検証プロキシ。localhostやプライベートIPを拒否
@@ -54,15 +57,36 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 - 既定ではGoogleの検索ボックスに入力して検索（`/search?q=`への直接遷移ではない）。
   `"human_input": false`で直接遷移に戻せます
 - Chrome、表示サーバー、プロキシの終了処理と孤児プロセスの回収
-- Linux専用
+- Linux / macOS対応
 
 ## 必要環境
 
 - Python 3.10以上
-- Google Chrome、Google Chrome for Testing、またはChromium
-- 窓を表示する場合: Linuxの`Xephyr`とデスクトップの`DISPLAY`
-- 窓を表示しない場合: Linuxの`Xvfb`
-- CAPTCHAを対話的に解除する場合（任意）: `xpra`
+- Google Chrome、Google Chrome for Testing、またはChromium。macOSでは
+  `CW_CHROME`の次にプロジェクト内`.local-chrome`のChrome for Testingを
+  自動検出するため、通常のChromeを`/Applications`へ入れる必要はありません
+- Linuxで窓を表示する場合: `Xephyr`とデスクトップの`DISPLAY`
+- Linuxで窓を表示しない場合: `Xvfb`
+- LinuxでCAPTCHAを対話的に解除する場合（任意）: `xpra`
+- macOSではXvfb/Xephyr/DISPLAYは不要
+
+## macOSでのインストール
+
+通常のChromeを`/Applications`へインストールせず、プロジェクト内のChrome for
+Testingだけで動かせます。
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[test]'
+python scripts/install-chrome-for-testing.py
+chrome-web-mcp
+```
+
+取得したブラウザはgit管理外の`.local-chrome/`へ保存されます。ブラウザの
+ダウンロードはこのスクリプトを明示的に実行した場合だけ行われ、MCPサーバーの
+起動時に勝手にダウンロードすることはありません。詳細は
+[`docs/macos.md`](docs/macos.md)を参照してください。
 
 ## ヘッドレス環境
 
@@ -79,10 +103,9 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 `CW_CONFIG`で別の場所を指定できます。変更後はMCPクライアントを再起動して
 ください。
 
-`show_browser: false`ではChromeを隠しXvfb上で起動します。内蔵デフォルトは
-デスクトップ利用向けの`true`なので、ヘッドレス環境ではこの設定を省略しないで
-ください。Docker版はコンテナ内でXvfbを使用するため、通常はホストのDISPLAYを
-設定する必要はありません。
+`show_browser: false`では、Linuxは隠しXvfb、macOSは`--headless=new`で
+Chromeを起動します。内蔵デフォルトはデスクトップ利用向けの`true`です。
+Docker版はLinuxコンテナ内でXvfbを使用します。
 
 ## Linuxでのインストール
 
@@ -168,7 +191,8 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 }
 ```
 
-- `show_browser`: `true`で`chrome-web-mcp`の窓を表示、`false`で非表示
+- `show_browser`: `true`でブラウザを表示、`false`で非表示。macOSでは
+  `true`がnative Chrome、`false`が`--headless=new`
 - `hl`: Googleの表示言語。`ja`は日本語、`en`は英語
 - `gl`: Googleの検索地域。`jp`は日本、`us`は米国
 - `limit`: `google_search`の既定結果数（1から20）
@@ -360,8 +384,9 @@ CAPTCHAを記録し、Googleを指数バックオフのクールダウンに入�
 
 ### `health_check`
 
-引数はありません。表示モード、Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち
-時間、直近の検索数、CAPTCHA時刻に加えて、CAPTCHA耐性の状態を返します。
+引数はありません。platform、表示モード、Chrome binary/version、GPU backend、
+Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち時間、直近の検索数、CAPTCHA時刻に
+加えて、CAPTCHA耐性の状態を返します。
 
 - `profile_mode`（`persistent`または`ephemeral`）、`profile_dir`、
   `profile_shared_fallback`（他プロセスが共有プロファイルを使用中で、自分専用の
@@ -404,8 +429,8 @@ CAPTCHAを解いてから同じ検索を再試行すると、次にGoogleが成�
 - 任意のページコンテキストJavaScriptを実行するツールは提供しません
 - ブラウザのHTTP(S)/WebSocket接続は公開アドレスに限定します
 - URL内の認証情報や明らかな秘密情報パターンを拒否します
-- サーバーごとにChromeと仮想ディスプレイを所有し、終了時に回収します
-- ホストのWaylandセッションではなく、明示したX11仮想ディスプレイ上でChromeを動かします
+- サーバーごとにChromeと必要な表示backendを所有し、終了時に回収します
+- Linuxは独立X11 display、macOSは独立temporary profileのnative/headless Chromeを使います
 - これは一般的なリモートブラウザ操作APIではありません
 
 ## 謝辞
