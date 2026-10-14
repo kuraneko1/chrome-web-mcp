@@ -209,9 +209,10 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 - `profile`: `persistent`（既定）はCookieなどを保持する永続プロファイル、
   `ephemeral`は従来の使い捨てプロファイル
 - `search_engines`: 試すエンジンの順序。`searxng`は`searxng_url`が必要
-- `searxng_url`: 自前のSearXNGのURL（`format=json`許可が必要）。公開URLのみ許可され、
-  `fetch_url`と同じ公開URLポリシーで検証されるため、`http://10.0.0.1:4000`のような
-  プライベートアドレスは拒否されます
+- `searxng_url`: 自前のSearXNGのURL（`format=json`許可が必要）。設定ファイル／環境変数
+  由来の値でありモデル出力からは設定されないため、`http://10.0.0.1:4000`のような
+  プライベートアドレスも使用できます（自前インスタンスの通常の到達方法）。リダイレクトは
+  追跡しないので、最終URLを直接指定してください
 - `human_input`: `true`（既定）でGoogleの検索ボックスに入力して検索
 - `max_searches_per_hour`: Googleのみの時間あたり上限（`0`で無効）
 - `captcha_cooldown_s` / `captcha_cooldown_max_s`: CAPTCHA後のクールダウン初回値と

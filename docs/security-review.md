@@ -190,16 +190,21 @@ Tests: `test_discover_chrome_skips_a_world_or_group_writable_candidate`,
 blind request to a private address (the body must parse as SearXNG JSON; only
 title/url/description surface).
 
-Fix: validate the configured base URL, disable redirects, and validate the final
-URL.
+Fix: require an absolute http(s) URL, disable redirects, and keep engine result
+URLs behind the normal host policy. The configured base URL stays private-address
+friendly on purpose (see the disposition below).
 
-Disposition: **fixed**. `_searxng_candidates()` validates the configured base URL
-with `_validate_public_url()`, uses `follow_redirects=False`, and validates the
-response URL. Behavior change: `searxng_url` must now be publicly reachable — a
-private instance (for example `http://10.0.0.1:4000`) is refused instead of
-queried. Documented in `README.md`, `README.jp.md` and `examples/config.md`.
-Tests: `test_searxng_refuses_a_private_base_url`,
-`test_searxng_validates_both_urls_and_does_not_follow_redirects`,
+Disposition: **fixed, with a deliberate scope limit.** Redirects are no longer
+followed, so a misconfigured or hostile instance cannot bounce the client to
+another host, and the value must be an absolute http(s) URL. The *base* URL is
+deliberately **not** run through the public-URL policy: it is operator-controlled
+(config file or environment, never model output) and a self-hosted instance
+normally lives on localhost or a LAN host, so requiring a public address would
+break the documented use case (and the README's own `http://10.0.0.1:4000`
+example). Engine result URLs still go through the same host policy as every other
+search result. Documented in `README.md`, `README.jp.md` and `examples/config.md`.
+Tests: `test_searxng_allows_an_operator_configured_private_base_url`,
+`test_searxng_rejects_a_non_http_base_url`, `test_searxng_does_not_follow_redirects`,
 `test_searxng_redirect_response_is_not_used`.
 
 ### F10 — quadratic join in the markdown fallback (low)

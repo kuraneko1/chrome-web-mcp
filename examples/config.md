@@ -126,10 +126,12 @@ reports `engine` (who answered), `attempts` (each engine with its outcome), and
 
 Base URL of a self-hosted SearXNG, e.g. `"https://searxng.example.com"`. The
 `searxng` engine is skipped until this is set. It is queried over SearXNG's JSON
-API, so the instance must allow `format=json`. The URL is checked by the same
-public-URL policy as a `fetch_url` target and redirects are not followed, so it
-must be publicly reachable: a private address such as `http://10.0.0.1:4000` is
-refused instead of queried.
+API, so the instance must allow `format=json`. The value comes from your own
+config or environment, never from model output, so a private address such as
+`http://10.0.0.1:4000` or `http://127.0.0.1:8080` is allowed - that is how a
+self-hosted instance is normally reached. Redirects are not followed, so a
+misconfigured instance cannot bounce the request to another host; point this at
+the final URL instead.
 
 ### `human_input`
 

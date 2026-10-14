@@ -1190,20 +1190,33 @@ async def _fetch_engine_candidates(
 
 
 async def _searxng_candidates(query: str, limit: int, hl: str) -> list[dict]:
-    """Query a self-hosted SearXNG instance over its JSON API."""
+    """Query a self-hosted SearXNG instance over its JSON API.
+
+    ``searxng_url`` comes from the operator's config or environment, never from
+    model output, so a private address (localhost or a LAN host) is legitimate -
+    that is how a self-hosted instance is normally reached - and is deliberately
+    not run through the public-URL policy. Redirects are not followed, so a
+    misconfigured or hostile instance cannot bounce the client to an arbitrary
+    private target, and the engine's result URLs go through the same host policy
+    as every other search result (F9).
+    """
     base = _searxng_url()
     if not base:
         raise RuntimeError("searxng engine selected but searxng_url is not configured")
-    # A misconfigured base URL must not turn into a blind request to a private
-    # address, so it goes through the same public-URL policy as a fetch (F9).
-    base = _validate_public_url(base)
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError("searxng_url must be an absolute http(s) URL")
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
         response = await client.get(
             f"{base}/search",
             params={"q": query, "format": "json", "language": hl},
             headers={"Accept": "application/json"},
         )
-    _validate_public_url(str(response.url))
+    if response.is_redirect:
+        raise RuntimeError(
+            f"SearXNG returned a redirect (HTTP {response.status_code}); "
+            "point searxng_url at the final URL"
+        )
     if response.status_code != 200:
         raise RuntimeError(
             f"SearXNG returned HTTP {response.status_code} "

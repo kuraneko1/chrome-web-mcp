@@ -539,6 +539,10 @@ values; add them only to change the behavior:
 - `profile`: `persistent` keeps a warm profile (fewer CAPTCHAs); `ephemeral`
   restores the throwaway per-process profile.
 - `search_engines`: engines to try, in order. `searxng` requires `searxng_url`.
+- `searxng_url`: base URL of a self-hosted SearXNG (needs `format=json`). It comes
+  from your config or environment, never from model output, so a private address
+  (`http://127.0.0.1:8080`, `http://10.0.0.1:4000`) is allowed. Redirects are not
+  followed; point it at the final URL.
 - `human_input`: type the query into the Google box instead of loading
   `/search?q=` directly.
 - `max_searches_per_hour` / `captcha_cooldown_s` / `captcha_cooldown_max_s`:
