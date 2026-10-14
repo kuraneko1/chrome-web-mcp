@@ -65,7 +65,7 @@ from chrome_web_mcp.cdp import (
 )
 # Re-exported: callers and tests catch these as attributes of this module.
 from chrome_web_mcp.errors import CaptchaRequired, SearchFailed
-# Re-exported: _read_page_string/_fetch_page (kept here) and tests use these.
+# Re-exported: _fetch_page/_read_google_results (kept here) and tests use these.
 from chrome_web_mcp.extract import (
     MAX_EXTRACTION_CHARS,
     _EXTRACT_RESULTS_JS,
