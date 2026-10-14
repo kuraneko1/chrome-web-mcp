@@ -88,6 +88,7 @@ from chrome_web_mcp.urlpolicy import (
     _is_google_host,
     _normalize_candidate_href,
     _validate_public_url,
+    _validate_search_query,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -1270,6 +1271,7 @@ async def _search_google(
     Returns (results, waited_seconds, pace_warning) so callers can expose
     queue waits and burst warnings.
     """
+    _validate_search_query(query)
     async with _SEARCH_LOCK:
         wait_for = await asyncio.to_thread(_SEARCH_LIMITER.reserve_slot)
         if wait_for:
@@ -1292,6 +1294,9 @@ async def _search_with_fallback(
     What is new is that a Google CAPTCHA no longer ends the call: Google goes on
     a shared cooldown and the next configured engine answers the same query.
     """
+    # The query reaches every configured engine (and a SearXNG host), so it is
+    # gated exactly like a fetch URL before anything is sent (F2).
+    _validate_search_query(query)
     order = _engine_order(engine)
     attempts: list[dict] = []
     captcha_seen = False

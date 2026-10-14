@@ -238,6 +238,81 @@ def test_rejects_non_public_or_secret_result_urls(url):
         server._validate_public_url(url)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "AKIAIOSFODNN7EXAMPLE",
+        "ASIAIOSFODNN7EXAMPLE",
+        "gho_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ghs_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ghu_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ghr_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ya29.a0AfH6SMBx-0123456789abcdef",
+        "sk_live_0123456789abcdefghij",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g",
+    ],
+)
+def test_secret_gate_covers_new_credential_shapes(value):
+    """F2: the extended pattern must block these in URLs and in search queries."""
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_public_url(f"https://example.com/?x={value}")
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_search_query(f"look this up: {value}")
+
+
+def test_secret_gate_checks_percent_decoded_values():
+    encoded = "https://example.com/?token=sk-abcdefghijklmnopqrstuvwxyz"
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_public_url(encoded.replace("sk-", "sk%2D"))
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_search_query("query%3Dsk-abcdefghijklmnopqrstuvwxyz")
+
+
+def test_secret_gate_uses_own_environment_values_as_needles(monkeypatch):
+    """F2: a private token with no vendor prefix is caught via the process env."""
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "private-value-0123456789")
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_search_query("search for private-value-0123456789")
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_public_url("https://example.com/?q=private-value-0123456789")
+
+    # A short value, or one whose variable name is not credential-like, is not a needle.
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "short")
+    monkeypatch.setenv("INTERNAL_SERVICE_LABEL", "private-value-0123456789")
+    server._validate_search_query("search for private-value-0123456789")
+
+
+def test_secret_gate_never_echoes_the_offending_value(monkeypatch):
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    with pytest.raises(ValueError) as exc:
+        server._validate_public_url(f"https://example.com/?k={secret}")
+    assert secret not in str(exc.value)
+    with pytest.raises(ValueError) as exc:
+        server._validate_search_query(secret)
+    assert secret not in str(exc.value)
+
+
+def test_google_search_tool_blocks_queries_that_carry_secrets(monkeypatch, tmp_path):
+    """F2: the gate runs before any engine is asked, so nothing leaves the process."""
+    called = []
+
+    async def fake_google(query, limit, hl="ja", gl="jp"):
+        called.append(query)
+        return []
+
+    monkeypatch.setattr(server, "_extract_google_candidates", fake_google)
+    monkeypatch.setattr(server, "_ENGINE_STATE", server.SearchEngineState(tmp_path / "state.sqlite3"))
+    monkeypatch.setitem(server.CONFIG, "search_engines", ["google"])
+    payload = json.loads(
+        run_async(_call_tool("google_search", {"query": "AKIAIOSFODNN7EXAMPLE"}))[0].text
+    )
+    assert payload["success"] is False
+    assert "credential" in payload["error"]
+    assert "AKIA" not in payload["error"]
+    assert called == []
+
+
 def test_call_tool_returns_single_structured_json_layer(monkeypatch, tmp_path):
     async def fake_google(query, limit, hl="ja", gl="jp"):
         assert query == "Hermes Agent"
