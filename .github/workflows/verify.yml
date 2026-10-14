@@ -32,3 +32,15 @@ jobs:
         run: python -m pytest -q -m 'not live'
       - name: Build wheel and source distribution
         run: python -m build
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build non-root image
+        run: docker build -t chrome-web-mcp:test .
+      - name: Verify sandboxed Chrome and MCP without Internet
+        run: |
+          docker run --rm -i --network none --security-opt seccomp=docker/seccomp_profile.json --entrypoint python chrome-web-mcp:test - < tests/docker_smoke.py
+          docker run --rm -i --network none --user 1001:1001 -e HOME=/tmp --security-opt seccomp=docker/seccomp_profile.json --entrypoint python chrome-web-mcp:test - --xephyr < tests/docker_smoke.py
