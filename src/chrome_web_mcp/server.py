@@ -28,7 +28,7 @@ import tempfile
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 import mcp.types as types
@@ -55,6 +55,8 @@ from chrome_web_mcp.extract import (
 )
 # Re-exported for tests; _stop_recorded_process (kept here) calls _process_identity.
 from chrome_web_mcp.processes import _process_identity, _terminate_owned_process
+# Re-exported: the search orchestrators below call these with _resolve_candidate_url.
+from chrome_web_mcp.results import _build_results, _normalize_candidates
 # Re-exported for tests; the instances below stay here (patch targets).
 from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag
 # Re-exported: _resolve_candidate_url (kept here) and tests call these.
@@ -155,40 +157,6 @@ async def _resolve_candidate_url(href: str) -> str | None:
             return None
         current = urllib.parse.urljoin(current, location)
     return None
-
-
-async def _build_results(
-    candidates: list[dict],
-    limit: int,
-    *,
-    resolve_url: Callable[[str], Awaitable[str | None]],
-) -> list[dict]:
-    results: list[dict] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        title = " ".join(str(candidate.get("title", "")).split())
-        href = str(candidate.get("href", ""))
-        description = " ".join(str(candidate.get("description", "")).split())
-        if not title or not href:
-            continue
-        try:
-            url = await resolve_url(href)
-        except (ValueError, OSError, httpx.HTTPError):
-            continue
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        results.append(
-            {
-                "title": title[:300],
-                "url": url,
-                "description": description[:1000],
-                "position": len(results) + 1,
-            }
-        )
-        if len(results) >= limit:
-            break
-    return results
 
 
 def _stop_recorded_process(record: dict) -> None:
@@ -1450,28 +1418,6 @@ async def _search_google(
         raise RuntimeError("Google rendered no usable external search results")
     await asyncio.to_thread(_RUNTIME.hide_for_human)
     return results, wait_for, _pace_warning(pace_count)
-
-
-def _normalize_candidates(engine: str, candidates: list[dict]) -> list[dict]:
-    """Decode engine redirect wrappers before the shared URL validation runs.
-
-    Google result wrappers are resolved later by ``_resolve_candidate_url`` (it
-    also follows ``/goto``-style links), but DuckDuckGo and Bing return
-    ``//duckduckgo.com/l/?uddg=`` and ``bing.com/ck/a?...u=a1`` links that must be
-    decoded first - otherwise their scheme-less / engine-host URLs are dropped as
-    unusable and every fallback search looks empty.
-    """
-    if engine == "google":
-        return candidates
-    normalized: list[dict] = []
-    for candidate in candidates:
-        href = engines.normalize_href(engine, str(candidate.get("href", "")))
-        if not href:
-            continue
-        item = dict(candidate)
-        item["href"] = href
-        normalized.append(item)
-    return normalized
 
 
 async def _search_with_fallback(
