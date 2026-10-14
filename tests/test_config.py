@@ -3,6 +3,8 @@
 import json
 import os
 
+import pytest
+
 from chrome_web_mcp import server
 
 
@@ -37,6 +39,7 @@ def test_full_override(monkeypatch, tmp_path):
         "captcha_cooldown_max_s": 600,
         "spoof_platform": "windows",
         "disable_gpu": False,
+        "idle_release_s": 45,
     })
     monkeypatch.setenv("CW_CONFIG", path)
     cfg = server._load_config()
@@ -58,6 +61,7 @@ def test_full_override(monkeypatch, tmp_path):
         "captcha_cooldown_max_s": 600.0,
         "spoof_platform": "windows",
         "disable_gpu": False,
+        "idle_release_s": 45.0,
     }
 
 
@@ -80,11 +84,26 @@ def test_bad_values_fall_back_per_key(monkeypatch, tmp_path, capsys):
         "captcha_cooldown_max_s": 60,
         "spoof_platform": "mac",
         "disable_gpu": "no",
+        "idle_release_s": -1,
     })
     monkeypatch.setenv("CW_CONFIG", path)
     cfg = server._load_config()
     assert cfg == server._CONFIG_DEFAULTS
     assert "bogus_key" in capsys.readouterr().err
+
+
+def test_idle_release_accepts_zero_and_positive(monkeypatch, tmp_path):
+    monkeypatch.setenv("CW_CONFIG", write_config(tmp_path, {"idle_release_s": 0}))
+    assert server._load_config()["idle_release_s"] == 0.0
+    monkeypatch.setenv("CW_CONFIG", write_config(tmp_path, {"idle_release_s": 12.5}))
+    assert server._load_config()["idle_release_s"] == 12.5
+
+
+@pytest.mark.parametrize("value", ["soon", -1, True, None])
+def test_idle_release_bad_values_warn_and_keep_default(monkeypatch, tmp_path, capsys, value):
+    monkeypatch.setenv("CW_CONFIG", write_config(tmp_path, {"idle_release_s": value}))
+    assert server._load_config()["idle_release_s"] == server._CONFIG_DEFAULTS["idle_release_s"]
+    assert "idle_release_s" in capsys.readouterr().err
 
 
 def test_broken_json_falls_back_to_defaults(monkeypatch, tmp_path):
