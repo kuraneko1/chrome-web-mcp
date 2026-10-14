@@ -101,6 +101,67 @@ Minimum and maximum number of seconds between Google search starts. The actual
 delay is randomized in this range and shared across server processes to reduce
 CAPTCHA risk. `max_delay` must be greater than or equal to `min_delay`.
 
+## CAPTCHA-resilience settings
+
+These keys are optional; the defaults below are what the server already uses.
+
+### `profile`
+
+- `persistent` (default): one warm Chrome profile under
+  `~/.cache/chrome-web-mcp/profile`. Cookies, consent state, and the cache
+  survive between runs, so Google sees a returning browser instead of a new one.
+  Only one server process uses it at a time; a process that finds it busy falls
+  back to its own throwaway profile and reports `profile_shared_fallback: true`
+  from `health_check`. To reset it, stop the server and delete that directory.
+- `ephemeral`: the older behavior — a throwaway profile per process under
+  `/tmp/chrome-web-v2-profile/<pid>`, removed on exit.
+
+### `search_engines`
+
+The engines to try, in order. Default:
+`["google", "ddg", "brave", "bing"]`. When Google shows a CAPTCHA, the next
+engine answers the same query, so a search still returns results. The response
+reports `engine` (who answered), `attempts` (each engine with its outcome), and
+`captcha_avoided`.
+
+### `searxng_url`
+
+Base URL of a self-hosted SearXNG, e.g. `"http://10.0.0.1:4000"`. The `searxng`
+engine is skipped until this is set. It is queried over SearXNG's JSON API, so
+the instance must allow `format=json`.
+
+### `human_input`
+
+- `true` (default): open the Google home page, type the query into the search
+  box, and press Enter.
+- `false`: navigate straight to `/search?q=...`. Use this if typing misbehaves
+  in your environment; the direct path is also the automatic fallback.
+
+### `max_searches_per_hour`, `captcha_cooldown_s`, `captcha_cooldown_max_s`
+
+Google-only self-throttling, shared across server processes: after
+`max_searches_per_hour` searches (default `60`, `0` disables the budget) Google
+is skipped and the fallback engines answer. After a CAPTCHA, Google is skipped
+for `captcha_cooldown_s` seconds (default `300`), doubling for each consecutive
+CAPTCHA up to `captcha_cooldown_max_s` (default `1800`). A successful Google
+search clears the cooldown.
+
+### `spoof_platform`
+
+- `native` (default): leave the UA, `navigator.platform`, and client hints as
+  Chrome produces them on Linux. They already agree with each other, which is
+  what matters for bot detection.
+- `windows`: apply a Windows UA together with a matching `navigator.platform`
+  and user-agent client hints, so no single signal contradicts another.
+
+### `disable_gpu`
+
+- `true` (default): pass `--disable-gpu` (stable software rendering on headless
+  hosts and CI).
+- `false`: let Chrome use the host GPU. Note that on Xvfb/Xephyr hosts without a
+  usable GPU path Chrome may expose no WebGL context either way; the WebGL
+  vendor/renderer strings are normalized when WebGL is available.
+
 ## Precedence and restart
 
 When the same setting is specified more than once, the order is:
