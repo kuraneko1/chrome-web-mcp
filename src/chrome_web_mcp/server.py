@@ -44,6 +44,8 @@ from chrome_web_mcp import platform_runtime
 
 # ``_CONFIG_DEFAULTS`` is re-exported for tests; ``_load_config`` builds CONFIG below.
 from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
+# Re-exported: callers and tests catch these as attributes of this module.
+from chrome_web_mcp.errors import CaptchaRequired, SearchFailed
 
 try:
     import trafilatura
@@ -114,10 +116,6 @@ _SECRET_RE = re.compile(
 )
 _BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "metadata.goog"}
 _CDP_IDS = itertools.count(1)
-
-
-class CaptchaRequired(RuntimeError):
-    """The Google page requires a human interaction before search can continue."""
 
 
 def _is_google_challenge(url: str, text: str) -> bool:
@@ -1574,15 +1572,6 @@ def _configured_engines() -> list[str]:
 def _human_input_enabled() -> bool:
     """Whether to type the query into the Google box instead of /search?q=."""
     return _env_flag("CW_HUMAN_INPUT", bool(CONFIG["human_input"]))
-
-
-class SearchFailed(RuntimeError):
-    """Every configured engine failed; carries the per-engine attempt log."""
-
-    def __init__(self, message: str, attempts: list[dict], *, captcha: bool = False) -> None:
-        super().__init__(message)
-        self.attempts = attempts
-        self.captcha = captcha
 
 
 def _engine_skip_reason(engine: str) -> str | None:
