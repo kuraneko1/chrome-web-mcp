@@ -35,7 +35,7 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
   CAPTCHAを出した場合は他のエンジンへ自動フォールバックします。
 - `fetch_url`: 公開HTTP(S)ページを取得し、読みやすいテキストやMarkdownを返します。
 - `health_check`: ブラウザ、表示モード、検索待ち時間、CAPTCHA、プロファイル、
-  エンジンの状態を確認します。
+  エンジン、アイドル解放の状態を確認します。
 
 ## 特徴
 
@@ -54,6 +54,10 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
   ヒント、WebGLのベンダー文字列を互いに矛盾しないように揃えます（`spoof_platform`）
 - Google検索の開始間隔、CAPTCHAクールダウン、時間あたりの検索予算を
   SQLiteでプロセス間共有
+- アイドル解放: ブラウザ呼び出しが`idle_release_s`（既定5分）ないと
+  Chrome + Xvfb一式（実測約600 MB）を解放し、MCPプロセスは生かしたまま
+  次の呼び出しで透過的に再起動します（コールドスタート実測0.88秒）。
+  `idle_release_s: 0`で無効にできます
 - 既定ではGoogleの検索ボックスに入力して検索（`/search?q=`への直接遷移ではない）。
   `"human_input": false`で直接遷移に戻せます
 - Chrome、表示サーバー、プロキシの終了処理と孤児プロセスの回収
@@ -187,7 +191,8 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
   "captcha_cooldown_s": 300,
   "captcha_cooldown_max_s": 1800,
   "spoof_platform": "native",
-  "disable_gpu": true
+  "disable_gpu": true,
+  "idle_release_s": 300
 }
 ```
 
@@ -210,11 +215,16 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 - `spoof_platform`: `native`（既定）はLinuxのUAと`navigator.platform`を一致させる、
   `windows`はUA・platform・クライアントヒントをWindowsで揃える
 - `disable_gpu`: `true`（既定）でソフトウェアレンダリングを使用
+- `idle_release_s`: `google_search`/`fetch_url`の呼び出しがこの秒数ないときに
+  ブラウザを解放します（既定`300`、`0`で無効）。MCPサーバーのプロセスは
+  生きたまま、ブラウザ一式（Chrome + 表示backend、実測約600 MB）のメモリを
+  返します。次の呼び出しでは透過的に再起動します（コールドスタート実測0.88秒）。
+  永続プロファイルは削除されません。
 
 環境変数で上書きする場合は `CW_PROFILE_MODE`、`CW_SEARCH_ENGINES`、
 `CW_SEARXNG_URL`、`CW_HUMAN_INPUT`、`CW_MAX_SEARCHES_PER_HOUR`、
-`CW_CAPTCHA_COOLDOWN`、`CW_CAPTCHA_COOLDOWN_MAX` を使います（設定ファイルより
-優先されます）。
+`CW_CAPTCHA_COOLDOWN`、`CW_CAPTCHA_COOLDOWN_MAX`、`CW_IDLE_RELEASE` を使います
+（設定ファイルより優先されます）。
 
 日本語の検索結果にしたい場合は次を指定します。
 
@@ -394,6 +404,10 @@ Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち時間、直近の�
 - `engines`（試行順）、`engine_cooldowns_s`（エンジンごとの残りクールダウン秒）、
   `searches_last_hour`、`max_searches_per_hour`、`budget_exhausted`
 - `human_input`と`spoof_platform`（現在のフィンガープリント設定）
+- `idle_release_s`（現在のアイドル解放タイムアウト、無効時は`0`）、
+  `browser_idle_s`（最後のブラウザ呼び出しからの秒数、ブラウザ未起動時は`null`）、
+  `browser_releases`（プロセス起動後のアイドル解放回数）、`active_calls`
+  （実行中のブラウザ呼び出し数。`health_check`自身は数えません）
 
 health_check自体はブラウザを起動しません。
 

@@ -39,7 +39,8 @@ A stdio Model Context Protocol server that exposes focused browser tools:
 - `google_search` — Google search through a JavaScript-rendered Chrome instance,
   with automatic fallback to other engines when Google challenges.
 - `fetch_url` — JavaScript-rendered readable text extraction for public HTTP(S) URLs.
-- `health_check` — display, browser, queue, CAPTCHA, profile, and engine status.
+- `health_check` — display, browser, queue, CAPTCHA, profile, engine, and idle
+  release status.
 
 The server is designed to be configured by any MCP client that can launch a
 stdio command.
@@ -66,9 +67,14 @@ stdio command.
   hints, and WebGL vendor strings are kept mutually consistent (`"spoof_platform"`).
 - Shared SQLite pacing, CAPTCHA cooldowns, and an hourly search budget across
   MCP processes.
+- Idle release: after `idle_release_s` (default five minutes) without a browser
+  call the server frees its Chrome + display backend (~600 MB measured on
+  Linux/Xvfb) while the MCP process stays alive, then restarts it transparently
+  on the next call (0.88 s cold start measured). `idle_release_s: 0` disables it.
 - Query typed into the Google search box (not a direct `/search?q=` hit) by
   default; `"human_input": false` restores direct navigation.
-- `health_check` for display/browser/queue/CAPTCHA/profile/engine observability.
+- `health_check` for display/browser/queue/CAPTCHA/profile/engine/idle
+  observability.
 - Linux + macOS, with platform-specific browser/runtime isolation (Xvfb/Xephyr,
   `fcntl` and process groups on Linux; native Chrome or `--headless=new` on
   macOS).
@@ -383,6 +389,10 @@ uv pip list --python ~/.local/share/chrome-web-mcp/venv/bin/python | grep -E "ch
 - Total: ~600 MB, dominated by Chromium. No new system packages were added
   for markdown shaping (pure-Python dependencies only).
 
+Idle release (`idle_release_s`, default 300 s) gives that ~600 MB browser tree
+back while the server process stays alive; the next tool call pays the 0.88 s
+cold start. Set `idle_release_s: 0` to keep the browser warm.
+
 ## Tools
 
 Workflow: first `google_search`, then `fetch_url` on interesting result URLs
@@ -467,6 +477,11 @@ its `min`/`max` delays, `recent_searches_60s`, `pace_warning`, and
   remaining cooldown per engine), `searches_last_hour`,
   `max_searches_per_hour`, `budget_exhausted`.
 - `human_input` and `spoof_platform` (the active fingerprint mode).
+- `idle_release_s` (the active idle timeout, `0` when disabled), `browser_idle_s`
+  (seconds since the last browser tool call, `null` while no browser is
+  running), `browser_releases` (idle releases since this process started), and
+  `active_calls` (browser calls in flight; `health_check` itself does not
+  count).
 
 ## Runtime configuration
 
@@ -510,7 +525,8 @@ values; add them only to change the behavior:
   "captcha_cooldown_s": 300,
   "captcha_cooldown_max_s": 1800,
   "spoof_platform": "native",
-  "disable_gpu": true
+  "disable_gpu": true,
+  "idle_release_s": 300
 }
 ```
 
@@ -525,6 +541,11 @@ values; add them only to change the behavior:
   consistent; `windows` applies a matching Windows UA, platform, and client
   hints together.
 - `disable_gpu`: keep Chrome's software rendering (stable on headless hosts).
+- `idle_release_s`: release the browser after this many seconds without a
+  `google_search`/`fetch_url` call, freeing ~600 MB while the MCP process keeps
+  running; `0` disables it. Measured on a Debian host: the browser tree is about
+  600 MB RSS, a cold start takes 0.88 s, and cleanup 0.62 s — so an idle release
+  costs roughly 0.9 s on the next call. The persistent profile is kept.
 
 The JSON file is optional. If it is absent, the built-in defaults are used and
 the browser window is shown (`show_browser: true`). Set it to `false` to hide
@@ -561,6 +582,8 @@ Optional environment variables:
   seconds and the exponential cap. Defaults `300` / `1800`.
 - `CW_MIN_DELAY` / `CW_MAX_DELAY` — randomized gap (seconds) between Google
   search starts. Defaults `1.0` / `2.5`.
+- `CW_IDLE_RELEASE` — release the browser after this many idle seconds (`0`
+  disables it). Default `300`; a bad value falls back to the config.
 - `CW_DISPLAY_MODE` — advanced environment override for `show_browser`.
   Linux uses `xvfb` or `xephyr`. macOS uses `headless` or `native` (Linux names
   are accepted as compatibility aliases on macOS).

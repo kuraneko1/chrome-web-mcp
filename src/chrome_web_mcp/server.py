@@ -80,7 +80,7 @@ from chrome_web_mcp.processes import _process_identity, _terminate_owned_process
 # Re-exported: the search orchestrators below call these with _resolve_candidate_url.
 from chrome_web_mcp.results import _build_results, _normalize_candidates
 # Re-exported for tests; the instances below stay here (patch targets).
-from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag
+from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag, _env_float
 # Re-exported: _resolve_candidate_url (kept here) and tests call these.
 from chrome_web_mcp.urlpolicy import (
     _is_google_challenge,
@@ -282,6 +282,13 @@ class BrowserRuntime:
         # Set when the shared persistent profile was busy and this process fell
         # back to its own throwaway profile (reported by health_check).
         self.profile_fell_back = False
+        # Idle-release bookkeeping: active_calls counts browser tool calls in
+        # flight (the reaper never releases under one), last_used is the
+        # monotonic time a browser call last started (None until then), and
+        # browser_releases counts idle releases since this process started.
+        self.active_calls = 0
+        self.last_used: float | None = None
+        self.browser_releases = 0
 
     # Fingerprint hardening, injected into every new document before scripts run.
     #
@@ -1089,6 +1096,15 @@ def _human_input_enabled() -> bool:
     return _env_flag("CW_HUMAN_INPUT", bool(CONFIG["human_input"]))
 
 
+def _idle_release_s() -> float:
+    """Idle-release timeout in seconds: CW_IDLE_RELEASE wins over config.
+
+    Like the other numeric env overrides, a non-numeric value falls back to the
+    config/default and a negative one is clamped to 0 (disabled).
+    """
+    return max(0.0, _env_float("CW_IDLE_RELEASE", float(CONFIG["idle_release_s"])))
+
+
 def _engine_skip_reason(engine: str) -> str | None:
     """Why an engine should be skipped right now, or None to try it.
 
@@ -1600,6 +1616,9 @@ def _health_status() -> dict:
     chrome_alive = _RUNTIME.chrome is not None and _RUNTIME.chrome.poll() is None
     xvfb_alive = _RUNTIME.xvfb is not None and _RUNTIME.xvfb.poll() is None
     xephyr_alive = _RUNTIME.xephyr is not None and _RUNTIME.xephyr.poll() is None
+    browser_idle_s: float | None = None
+    if chrome_alive and _RUNTIME.last_used is not None:
+        browser_idle_s = round(max(0.0, time.monotonic() - _RUNTIME.last_used), 3)
     queue_wait_s = 0.0
     try:
         connection = _SEARCH_LIMITER._connect()
@@ -1633,6 +1652,15 @@ def _health_status() -> dict:
         "chrome_alive": chrome_alive,
         "xvfb_alive": xvfb_alive,
         "xephyr_alive": xephyr_alive,
+        # Idle release: the browser is freed after idle_release_s seconds
+        # without a browser tool call (0 disables), browser_idle_s is None while
+        # no browser runs, and browser_releases counts idle releases since this
+        # process started. active_calls is 0 unless a browser call is in flight
+        # (health_check itself deliberately does not count).
+        "idle_release_s": _idle_release_s(),
+        "browser_idle_s": browser_idle_s,
+        "browser_releases": _RUNTIME.browser_releases,
+        "active_calls": _RUNTIME.active_calls,
         **_RUNTIME.gpu_info,
         "rate_limiter_queue_wait_s": round(queue_wait_s, 3),
         "rate_limit_min_delay_s": _SEARCH_LIMITER.min_delay,
@@ -1661,8 +1689,19 @@ def _health_status() -> dict:
     }
 
 
+# Tools that drive the browser; only these mark the runtime busy and refresh the
+# idle clock. health_check deliberately does not: it reports browser_idle_s,
+# which would always read ~0 if the status query itself counted as browser use
+# (and a client polling health_check would then keep Chrome alive forever).
+_BROWSER_TOOLS = ("google_search", "fetch_url")
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    tracks_browser = name in _BROWSER_TOOLS
+    if tracks_browser:
+        _RUNTIME.active_calls += 1
+        _RUNTIME.last_used = time.monotonic()
     try:
         if name == "google_search":
             query = arguments.get("query", "")
@@ -1716,18 +1755,74 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             payload["captcha_required"] = True
     except Exception as exc:
         payload = {"success": False, "error": str(exc)}
+    finally:
+        if tracks_browser:
+            _RUNTIME.active_calls = max(0, _RUNTIME.active_calls - 1)
     return [types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+
+def _release_if_idle(runtime: Any, now: float, idle_s: float) -> bool:
+    """Release ``runtime``'s browser when it has been idle for ``idle_s``.
+
+    Dependency-free decision logic so tests can drive it with a fake runtime
+    and clock. Returns True only when a live browser was torn down: a disabled
+    timeout (``idle_s <= 0``), a runtime with a tool call in flight
+    (``active_calls > 0``), a runtime that never used a browser, and one whose
+    Chrome has already exited are all left alone. ``cleanup()`` keeps the
+    persistent profile (it only removes throwaway profiles).
+    """
+    if idle_s <= 0 or runtime.active_calls > 0:
+        return False
+    last_used = runtime.last_used
+    if last_used is None or now - last_used < idle_s:
+        return False
+    chrome = runtime.chrome
+    if chrome is None or chrome.poll() is not None:
+        return False
+    runtime.cleanup()
+    runtime.browser_releases += 1
+    return True
+
+
+# The reaper wakes at most this often; for a shorter timeout it wakes every
+# idle_release_s so a release is not delayed much past the deadline.
+_IDLE_REAPER_MAX_INTERVAL_S = 30.0
+
+
+def _idle_reaper_interval(idle_s: float) -> float:
+    """Seconds between reaper wake-ups for a given idle timeout."""
+    return min(_IDLE_REAPER_MAX_INTERVAL_S, idle_s)
+
+
+def _reaper_tick(idle_s: float) -> bool:
+    """One reaper tick: try to release the idle browser, swallowing failures."""
+    try:
+        return _release_if_idle(_RUNTIME, time.monotonic(), idle_s)
+    except Exception:
+        return False
+
+
+async def _idle_reaper_task(idle_s: float, interval_s: float) -> None:
+    """Wake periodically and release the browser once it has been idle.
+
+    ``main()`` cancels this on teardown. ``asyncio.CancelledError`` derives from
+    ``BaseException``, so the per-tick ``except Exception`` does not eat it.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        _reaper_tick(idle_s)
 
 
 async def main() -> None:
     loop = asyncio.get_running_loop()
-    state: dict = {"task": None, "handling": False}
+    state: dict = {"task": None, "reaper": None, "handling": False}
 
     def _teardown() -> None:
         """Synchronous best-effort teardown used from the signal callback."""
-        task = state.get("task")
-        if task is not None:
-            task.cancel()
+        for key in ("task", "reaper"):
+            task = state.get(key)
+            if task is not None:
+                task.cancel()
         _RUNTIME.cleanup()
         # The stdio transport's writer task blocks on open pipes; os._exit is
         # the deterministic way to leave without waiting on the task group.
@@ -1746,14 +1841,32 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: _teardown())
 
+    # Idle release (disabled by idle_release_s/CW_IDLE_RELEASE=0): the browser is
+    # freed after the timeout while this process keeps serving; the next tool
+    # call starts it again transparently.
+    idle_s = _idle_release_s()
+    if idle_s > 0:
+        state["reaper"] = asyncio.create_task(
+            _idle_reaper_task(idle_s, _idle_reaper_interval(idle_s))
+        )
+
     async with stdio_server() as (read_stream, write_stream):
         run_task = asyncio.create_task(
             app.run(read_stream, write_stream, app.create_initialization_options())
         )
         state["task"] = run_task
-        await run_task
-        # run_task finishes only when the client closes stdin (EOF): exit the
-        # transport context so the reader/writer tasks wind down normally.
+        try:
+            await run_task
+            # run_task finishes only when the client closes stdin (EOF): exit the
+            # transport context so the reader/writer tasks wind down normally.
+        finally:
+            reaper = state.get("reaper")
+            if reaper is not None:
+                reaper.cancel()
+                try:
+                    await reaper
+                except asyncio.CancelledError:
+                    pass
 
 
 atexit.register(_RUNTIME.cleanup)
