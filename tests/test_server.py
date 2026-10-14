@@ -111,6 +111,69 @@ def test_structural_probe_hit_raises_captcha_required(monkeypatch):
         run_async(server._read_google_results(object()))
 
 
+def test_engine_challenge_check_uses_the_structural_probe(monkeypatch):
+    """F1: fallback engines must not classify their rendered body text either."""
+    expressions = []
+    blocked_args = []
+
+    class FakeConn:
+        async def send(self, msg):
+            pass
+
+        async def recv(self):
+            return '{"id": 1, "result": {}}'
+
+        async def close(self):
+            pass
+
+    async def fake_connect(*args, **kwargs):
+        return FakeConn()
+
+    async def fake_cdp(conn, method, params=None):
+        return {}
+
+    async def fake_evaluate(conn, expr):
+        expressions.append(expr)
+        return "" if expr == server._PAGE_CHALLENGE_PROBE_JS else "not a robot"
+
+    async def fake_search_page(browser):
+        return FakeConn(), "tab", False
+
+    async def fake_wait(conn):
+        return None
+
+    async def fake_to_thread(fn, *a, **k):
+        result = fn(*a, **k)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    runtime = server.BrowserRuntime()
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(runtime, "ensure", lambda: "ws://127.0.0.1:1/devtools/browser/x")
+    monkeypatch.setattr(server.websockets, "connect", fake_connect)
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(server, "_wait_ready", fake_wait)
+    monkeypatch.setattr(server, "_ensure_search_page", fake_search_page)
+    monkeypatch.setattr(server, "_read_page_html", lambda page: _async_value("<html></html>"))
+    monkeypatch.setattr(server.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        server.engines, "looks_blocked",
+        lambda engine, challenge_text: blocked_args.append(challenge_text) or False,
+    )
+    monkeypatch.setattr(server.engines, "parse_results", lambda engine, html, limit: [])
+
+    assert run_async(server._fetch_engine_candidates("ddg", "q", 5, "ja", "jp")) == []
+    assert server._PAGE_CHALLENGE_PROBE_JS in expressions
+    assert "document.body?.innerText || ''" not in expressions
+    assert blocked_args == [""]
+
+
+async def _async_value(value):
+    return value
+
+
 def test_human_display_environment_uses_real_x11_display(monkeypatch):
     monkeypatch.setenv("DISPLAY", ":0")
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
