@@ -33,6 +33,12 @@ def run_async(awaitable):
     return asyncio.run(awaitable)
 
 
+class _FakeProxy:
+    """Stands in for PublicNetworkProxy when only its URL is needed."""
+
+    url = "http://127.0.0.1:12345"
+
+
 def test_exposes_google_search_and_fetch_url_tool_names():
     tools = run_async(_list_tools())
     assert sorted(tool.name for tool in tools) == ["fetch_url", "google_search", "health_check"]
@@ -446,16 +452,44 @@ def test_fetch_page_sets_the_download_policy_before_navigating(monkeypatch):
 
 def test_chrome_command_bounds_the_disk_cache(monkeypatch):
     """F3: an unbounded cache is the other half of the download problem."""
-
-    class FakeProxy:
-        url = "http://127.0.0.1:12345"
-
     monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
     monkeypatch.setattr(server.BrowserRuntime, "_chrome_executable", staticmethod(lambda: "/bin/echo"))
     runtime = server.BrowserRuntime()
-    runtime.proxy = FakeProxy()
+    runtime.proxy = _FakeProxy()
 
     assert "--disk-cache-size=67108864" in runtime._chrome_command()
+
+
+def _root_runtime(monkeypatch):
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
+    monkeypatch.setattr(server.BrowserRuntime, "_chrome_executable", staticmethod(lambda: "/bin/echo"))
+    monkeypatch.setattr(server.os, "geteuid", lambda: 0)
+    runtime = server.BrowserRuntime()
+    runtime.proxy = _FakeProxy()
+    return runtime
+
+
+def test_refuses_to_render_as_root_without_the_opt_in(monkeypatch):
+    """F6: --no-sandbox as root would make a renderer escape host root."""
+    monkeypatch.delenv("CW_ALLOW_ROOT", raising=False)
+
+    with pytest.raises(RuntimeError, match="CW_ALLOW_ROOT"):
+        _root_runtime(monkeypatch)._chrome_command()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+def test_root_opt_in_restores_no_sandbox(monkeypatch, value):
+    monkeypatch.setenv("CW_ALLOW_ROOT", value)
+
+    assert "--no-sandbox" in _root_runtime(monkeypatch)._chrome_command()
+
+
+def test_health_check_reports_running_as_root(monkeypatch):
+    monkeypatch.setattr(server.os, "geteuid", lambda: 0)
+
+    payload = json.loads(run_async(_call_tool("health_check", {}))[0].text)
+
+    assert payload["data"]["running_as_root"] is True
 
 
 def test_fetch_page_runs_concurrent_calls_on_separate_tabs(monkeypatch):

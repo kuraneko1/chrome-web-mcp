@@ -793,6 +793,14 @@ class BrowserRuntime:
             if self.display_mode == "headless":
                 command.insert(1, "--headless=new")
         if os.geteuid() == 0:
+            # Rendering attacker-controlled HTML with the sandbox off means a
+            # renderer escape is host root (F6), so it is explicitly opt-in.
+            if not _root_allowed():
+                raise RuntimeError(
+                    "Refusing to run Chrome as root: --no-sandbox would make a "
+                    "renderer escape host root. Run as an unprivileged user (the "
+                    "Docker image uses UID 1000), or set CW_ALLOW_ROOT=1 to accept it."
+                )
             command.insert(1, "--no-sandbox")
         return command
 
@@ -1328,6 +1336,11 @@ def _xpra_expose_enabled() -> bool:
     return os.environ.get("CW_XPRA_EXPOSE", "").strip() == "1"
 
 
+def _root_allowed() -> bool:
+    """Whether rendering as root is explicitly accepted (F6)."""
+    return _env_flag("CW_ALLOW_ROOT", False)
+
+
 def _captcha_detail_for_mode() -> str:
     if _RUNTIME.display_mode == "native":
         return (
@@ -1715,6 +1728,9 @@ def _health_status() -> dict:
     return {
         "platform": platform_runtime.platform_description(),
         "display_mode": _RUNTIME.display_mode,
+        # Root rendering is refused unless CW_ALLOW_ROOT=1 (F6); report which
+        # case this process is in so a root-run container is diagnosable.
+        "running_as_root": os.geteuid() == 0,
         "chrome_binary": chrome_binary,
         "chrome_version": chrome_version,
         "chrome_detection_error": chrome_detection_error,
