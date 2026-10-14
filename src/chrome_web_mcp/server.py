@@ -702,11 +702,11 @@ class BrowserRuntime:
         xauth = self._xauth_binary()
         directory = Path(tempfile.mkdtemp(prefix="chrome-web-mcp-xauth-"))
         path = directory / "Xauthority"
-        # Create the file 0600 *before* xauth writes the cookie into it.
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(descriptor)
-        cookie = secrets.token_hex(16)  # 128-bit MIT-MAGIC-COOKIE-1
         try:
+            # Create the file 0600 *before* xauth writes the cookie into it.
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            cookie = secrets.token_hex(16)  # 128-bit MIT-MAGIC-COOKIE-1
             subprocess.run(
                 [xauth, "-f", str(path), "add", display, "MIT-MAGIC-COOKIE-1", cookie],
                 check=True,
@@ -794,6 +794,12 @@ class BrowserRuntime:
             raise RuntimeError("Public-network proxy is not ready")
         command = [
             self._chrome_executable(),
+            # F4 is deferred on purpose: this loopback listener is unauthenticated,
+            # so any local user who finds the port can drive the browser (a
+            # non-browser client sends no Origin, so Chrome's check does not
+            # apply). Moving to --remote-debugging-pipe (process-private fds, no
+            # TCP listener at all) belongs to the shared-browser work; until then
+            # this is a local-user boundary, documented in docs/security-review.md.
             "--remote-debugging-address=127.0.0.1",
             "--remote-debugging-port=0",
             f"--proxy-server={self.proxy.url}",
