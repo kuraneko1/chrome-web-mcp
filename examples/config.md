@@ -124,9 +124,12 @@ reports `engine` (who answered), `attempts` (each engine with its outcome), and
 
 ### `searxng_url`
 
-Base URL of a self-hosted SearXNG, e.g. `"http://10.0.0.1:4000"`. The `searxng`
-engine is skipped until this is set. It is queried over SearXNG's JSON API, so
-the instance must allow `format=json`.
+Base URL of a self-hosted SearXNG, e.g. `"https://searxng.example.com"`. The
+`searxng` engine is skipped until this is set. It is queried over SearXNG's JSON
+API, so the instance must allow `format=json`. The URL is checked by the same
+public-URL policy as a `fetch_url` target and redirects are not followed, so it
+must be publicly reachable: a private address such as `http://10.0.0.1:4000` is
+refused instead of queried.
 
 ### `human_input`
 
@@ -169,6 +172,14 @@ When the same setting is specified more than once, the order is:
    `CW_MAX_DELAY`)
 3. `config.json`
 4. Built-in default
+
+Some security switches exist only as environment variables, because they are not
+per-user preferences:
+
+- `CW_ALLOW_ROOT=1` — allow rendering as root. Unset by default: the server
+  refuses to start Chrome as root, since it renders attacker-controlled HTML and
+  would have to pass `--no-sandbox`. Run as an unprivileged user instead; the
+  Docker image already uses UID 1000.
 
 Restart the MCP client after changing the file. Values are loaded when the
 server process starts, not on every tool call.

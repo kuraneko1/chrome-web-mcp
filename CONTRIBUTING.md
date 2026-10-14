@@ -9,7 +9,9 @@ python -m pip install -e '.[test]'
 ```
 
 Requires Python 3.10+ and Chrome/Chromium. Linux hidden-browser tests require
-Xvfb; macOS uses native/headless Chrome and does not require X11.
+Xvfb and xauth (the private display is started with a per-display
+MIT-MAGIC-COOKIE-1 file); macOS uses native/headless Chrome and does not require
+X11.
 
 ## Verification
 

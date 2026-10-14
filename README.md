@@ -81,6 +81,9 @@ stdio command.
   `.local-chrome` after `CW_CHROME`, so a system Chrome install is optional.
 - `Xephyr` on Linux for the default visible-window mode
 - `Xvfb` on Linux for hidden-window mode
+- `xauth` on Linux: the private display is started with a per-display
+  MIT-MAGIC-COOKIE-1 file, and the server refuses to start a display it cannot
+  authenticate
 - `xpra` on Linux if interactive CAPTCHA recovery is desired
 
 The Python dependencies are installed with the package. Chrome remains an
@@ -139,7 +142,7 @@ display or extra setting.
 
 ```bash
 # 1. System dependencies
-sudo apt update && sudo apt install -y chromium xvfb xserver-xephyr x11-utils python3-venv
+sudo apt update && sudo apt install -y chromium xvfb xserver-xephyr xauth x11-utils python3-venv
 which chromium || which google-chrome || which chromium-browser
 which Xvfb
 python3 --version  # 3.10+
@@ -248,8 +251,8 @@ stdio and must not add shell-specific quoting around the arguments.
 
 ## Docker
 
-The image bundles Python, dependencies, Chromium, Xvfb (plus Xephyr/xdotool
-for visible-window mode), so users only need Docker:
+The image bundles Python, dependencies, Chromium, Xvfb (plus Xephyr/xdotool and
+xauth for visible-window mode), so users only need Docker:
 
 ```bash
 docker build -t chrome-web-mcp .
@@ -380,6 +383,7 @@ uv pip list --python ~/.local/share/chrome-web-mcp/venv/bin/python | grep -E "ch
 - This package source: under 1 MB
 - Chromium set: ~485 MB
 - Xvfb + x11-utils: ~5 MB
+- xauth: <1 MB
 - Total: ~600 MB, dominated by Chromium. No new system packages were added
   for markdown shaping (pure-Python dependencies only).
 
@@ -458,7 +462,9 @@ Input: `{}` (no arguments).
 
 Returns `display_mode`, browser/process liveness, the rate-limiter queue wait,
 its `min`/`max` delays, `recent_searches_60s`, `pace_warning`, and
-`last_captcha_at`. It also reports the CAPTCHA-resilience state:
+`last_captcha_at`. `running_as_root` reports whether the process runs as root
+(in which case rendering is refused unless `CW_ALLOW_ROOT=1`). It also reports
+the CAPTCHA-resilience state:
 
 - `profile_mode` (`persistent` or `ephemeral`), `profile_dir`, and
   `profile_shared_fallback` (true when a sibling session owned the shared
@@ -554,7 +560,10 @@ Optional environment variables:
   the same user share one limiter.
 - `CW_SEARCH_ENGINES` — comma-separated engine order, e.g. `google,ddg,brave,bing`.
 - `CW_SEARXNG_URL` — base URL of a self-hosted SearXNG; enables the `searxng`
-  engine (it is skipped while this is unset).
+  engine (it is skipped while this is unset). The URL must be publicly
+  reachable: it goes through the same public-URL policy as a `fetch_url` target,
+  so a private address (e.g. `http://10.0.0.1:4000`) is refused rather than
+  queried.
 - `CW_HUMAN_INPUT` — `0` disables typing into the Google search box.
 - `CW_MAX_SEARCHES_PER_HOUR` — Google-only hourly budget (`0` disables it).
 - `CW_CAPTCHA_COOLDOWN` / `CW_CAPTCHA_COOLDOWN_MAX` — first CAPTCHA cooldown in
@@ -573,6 +582,10 @@ Optional environment variables:
   CAPTCHA appears. Off by default: automatic attach once crashed the desktop
   session, so the server only reports the CAPTCHA and leaves the browser
   where it is.
+- `CW_ALLOW_ROOT` — set to `1` to allow rendering as root. Off by default:
+  the server refuses to start Chrome as root because it renders
+  attacker-controlled HTML and would have to pass `--no-sandbox`. Run as an
+  unprivileged user instead; the Docker image already uses UID 1000.
 
 The default profile is warm and persistent: cookies, consent state, and the
 Chrome cache survive between runs, which is what keeps Google from treating
@@ -602,10 +615,26 @@ randomized gap. `fetch_url` is not put through this Google-search queue.
   a local validating proxy; private destinations are rejected before connecting.
   Input URLs also reject embedded credentials and recognizable secret patterns.
   This does not classify every possible secret in arbitrary page URLs/content.
+  `google_search` queries pass the same gate before any engine (including a
+  configured SearXNG host) sees them.
+- Downloads are denied on every browser session, and the HTTP cache is bounded,
+  so a `Content-Disposition: attachment` response cannot fill the disk.
 - Each server owns and cleans up its Chrome and platform display process groups.
-- Linux Chrome is forced onto its private X11 display. macOS Chrome uses a
-  separate temporary profile and native/headless backend without touching the
-  user's normal Chrome profile.
+- Linux Chrome is forced onto its private X11 display, which is started with a
+  per-display MIT-MAGIC-COOKIE-1 file (`XAUTHORITY`); without `xauth` the server
+  fails closed instead of starting a display any local user could read. macOS
+  Chrome uses a separate temporary profile and native/headless backend without
+  touching the user's normal Chrome profile.
+- The throwaway profile directory is created atomically with mode 0700, and a
+  pre-existing directory that is not private and owned by this user is refused.
+- A discovered Chrome/Chromium binary is only executed when it is a regular file
+  owned by this user or root and not group/world-writable; `CW_CHROME` is
+  validated the same way.
+- Rendering as root is refused unless `CW_ALLOW_ROOT=1`, because it would
+  require `--no-sandbox`.
+- The loopback DevTools port (`--remote-debugging-port=0`) is unauthenticated
+  and therefore a local-user boundary until the shared-browser work moves it to
+  `--remote-debugging-pipe`; see `docs/security-review.md` (F4).
 - SIGTERM and SIGINT trigger browser and temporary-profile cleanup before exit.
   Startup recovers recorded Chrome/display processes using PID and start time,
   not broad process-name matching. Legacy profiles without process records can

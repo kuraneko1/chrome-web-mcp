@@ -10,8 +10,8 @@ Two families are supported:
 * ``browser`` engines are rendered in the shared Chrome tab and parsed from the
   rendered HTML (so JavaScript-only result layouts still work).
 * ``http`` engines are called directly with httpx - used for a self-hosted
-  SearXNG instance, which lives on a private address the browser proxy
-  deliberately refuses to reach.
+  SearXNG instance. Its base URL must pass the same public-URL policy as a
+  fetch target, so a private address is refused instead of queried blindly.
 
 Parsing lives here in Python rather than in per-engine page JavaScript so every
 selector can be unit-tested offline against saved fixtures (``tests/fixtures``).
