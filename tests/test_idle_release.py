@@ -4,6 +4,8 @@ The decision function is driven with a fake runtime and an explicit clock, so
 these tests never start a browser and never sleep.
 """
 
+import asyncio
+
 import pytest
 
 from chrome_web_mcp import server
@@ -100,3 +102,82 @@ def test_idle_release_defaults_to_300_seconds(monkeypatch):
     monkeypatch.delenv("CW_IDLE_RELEASE", raising=False)
     monkeypatch.setattr(server, "CONFIG", dict(server._CONFIG_DEFAULTS))
     assert server._idle_release_s() == 300.0
+
+
+def test_idle_reaper_interval_is_capped_at_30s():
+    assert server._idle_reaper_interval(300.0) == 30.0
+    assert server._idle_reaper_interval(5.0) == 5.0
+
+
+def test_reaper_tick_uses_the_clock_and_swallows_errors(monkeypatch):
+    seen = []
+
+    def fake_release(runtime, now, idle_s):
+        seen.append((runtime, now, idle_s))
+        return True
+
+    runtime = FakeRuntime(chrome=FakeChrome())
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(server, "_release_if_idle", fake_release)
+    assert server._reaper_tick(5.0) is True
+    assert seen[0][0] is runtime and seen[0][2] == 5.0
+
+    def boom(runtime, now, idle_s):
+        raise RuntimeError("cleanup exploded")
+
+    monkeypatch.setattr(server, "_release_if_idle", boom)
+    assert server._reaper_tick(5.0) is False  # swallowed, reaper keeps running
+
+
+def test_idle_reaper_task_wakes_and_ticks(monkeypatch):
+    ticks = []
+    monkeypatch.setattr(server, "_reaper_tick", lambda idle_s: ticks.append(idle_s))
+
+    async def run():
+        task = asyncio.create_task(server._idle_reaper_task(5.0, 0))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert ticks
+    assert set(ticks) == {5.0}
+
+
+def test_main_schedules_and_cancels_the_reaper_only_when_enabled(monkeypatch):
+    started = []
+
+    async def fake_reaper(idle_s, interval_s):
+        started.append((idle_s, interval_s))
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            started.append("cancelled")
+            raise
+
+    class FakeStdio:
+        async def __aenter__(self):
+            return None, None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def fake_run(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(server, "_idle_reaper_task", fake_reaper)
+    monkeypatch.setattr(server, "stdio_server", lambda: FakeStdio())
+    monkeypatch.setattr(server.app, "run", fake_run)
+    monkeypatch.setattr(server, "_RUNTIME", FakeRuntime())
+
+    monkeypatch.setattr(server, "_idle_release_s", lambda: 5.0)
+    asyncio.run(server.main())
+    assert started[0] == (5.0, 5.0)
+    assert "cancelled" in started  # cancelled on the normal EOF exit path
+
+    started.clear()
+    monkeypatch.setattr(server, "_idle_release_s", lambda: 0.0)
+    asyncio.run(server.main())
+    assert started == []  # idle_release_s=0 restores today's behaviour

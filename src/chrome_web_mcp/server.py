@@ -1772,15 +1772,45 @@ def _release_if_idle(runtime: Any, now: float, idle_s: float) -> bool:
     return True
 
 
+# The reaper wakes at most this often; for a shorter timeout it wakes every
+# idle_release_s so a release is not delayed much past the deadline.
+_IDLE_REAPER_MAX_INTERVAL_S = 30.0
+
+
+def _idle_reaper_interval(idle_s: float) -> float:
+    """Seconds between reaper wake-ups for a given idle timeout."""
+    return min(_IDLE_REAPER_MAX_INTERVAL_S, idle_s)
+
+
+def _reaper_tick(idle_s: float) -> bool:
+    """One reaper tick: try to release the idle browser, swallowing failures."""
+    try:
+        return _release_if_idle(_RUNTIME, time.monotonic(), idle_s)
+    except Exception:
+        return False
+
+
+async def _idle_reaper_task(idle_s: float, interval_s: float) -> None:
+    """Wake periodically and release the browser once it has been idle.
+
+    ``main()`` cancels this on teardown. ``asyncio.CancelledError`` derives from
+    ``BaseException``, so the per-tick ``except Exception`` does not eat it.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        _reaper_tick(idle_s)
+
+
 async def main() -> None:
     loop = asyncio.get_running_loop()
-    state: dict = {"task": None, "handling": False}
+    state: dict = {"task": None, "reaper": None, "handling": False}
 
     def _teardown() -> None:
         """Synchronous best-effort teardown used from the signal callback."""
-        task = state.get("task")
-        if task is not None:
-            task.cancel()
+        for key in ("task", "reaper"):
+            task = state.get(key)
+            if task is not None:
+                task.cancel()
         _RUNTIME.cleanup()
         # The stdio transport's writer task blocks on open pipes; os._exit is
         # the deterministic way to leave without waiting on the task group.
@@ -1799,14 +1829,32 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: _teardown())
 
+    # Idle release (disabled by idle_release_s/CW_IDLE_RELEASE=0): the browser is
+    # freed after the timeout while this process keeps serving; the next tool
+    # call starts it again transparently.
+    idle_s = _idle_release_s()
+    if idle_s > 0:
+        state["reaper"] = asyncio.create_task(
+            _idle_reaper_task(idle_s, _idle_reaper_interval(idle_s))
+        )
+
     async with stdio_server() as (read_stream, write_stream):
         run_task = asyncio.create_task(
             app.run(read_stream, write_stream, app.create_initialization_options())
         )
         state["task"] = run_task
-        await run_task
-        # run_task finishes only when the client closes stdin (EOF): exit the
-        # transport context so the reader/writer tasks wind down normally.
+        try:
+            await run_task
+            # run_task finishes only when the client closes stdin (EOF): exit the
+            # transport context so the reader/writer tasks wind down normally.
+        finally:
+            reaper = state.get("reaper")
+            if reaper is not None:
+                reaper.cancel()
+                try:
+                    await reaper
+                except asyncio.CancelledError:
+                    pass
 
 
 atexit.register(_RUNTIME.cleanup)
