@@ -68,9 +68,9 @@ stdio command.
 - Shared SQLite pacing, CAPTCHA cooldowns, and an hourly search budget across
   MCP processes.
 - Idle release: after `idle_release_s` (default five minutes) without a browser
-  call the server frees its Chrome + Xvfb tree (~600 MB measured) while the MCP
-  process stays alive, then restarts it transparently on the next call (0.88 s
-  cold start measured). `idle_release_s: 0` disables it.
+  call the server frees its Chrome + display backend (~600 MB measured on
+  Linux/Xvfb) while the MCP process stays alive, then restarts it transparently
+  on the next call (0.88 s cold start measured). `idle_release_s: 0` disables it.
 - Query typed into the Google search box (not a direct `/search?q=` hit) by
   default; `"human_input": false` restores direct navigation.
 - `health_check` for display/browser/queue/CAPTCHA/profile/engine/idle

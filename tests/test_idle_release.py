@@ -1,7 +1,8 @@
-"""Idle browser release: decision logic and CW_IDLE_RELEASE/CONFIG plumbing.
+"""Idle browser release: decision logic, scheduling, health and config plumbing.
 
 The decision function is driven with a fake runtime and an explicit clock, so
-these tests never start a browser and never sleep.
+the deterministic tests never start a browser and never sleep. The ``live`` test
+at the end is opt-in and skips cleanly without Xvfb/Chrome.
 """
 
 import asyncio
