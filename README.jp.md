@@ -8,7 +8,7 @@
 > [docs/macos.md](docs/macos.md)を参照してください。
 
 > [!CAUTION]
-> 1つのプロファイルにつき、ブラウザは1つだけ使用してください。
+> 1つのプロファイルにつきブラウザは1つですが、複数のMCPプロセスで共有します。
 >
 > - 通常の利用ではレート制限にかかりません。1分間に15回以上の検索を
 >   開始すると`pace_warning`が返ります。
@@ -23,10 +23,13 @@
 >   現在の状態は`health_check`の`last_captcha_at`と`engine_cooldowns_s`で
 >   確認できます。全エンジンがクールダウン中の場合は、数分待ってから再試行して
 >   ください。
-> - 別々のMCPプロセスは、永続プロファイルを共有します（同時にブラウザを
->   使えるのは1つ）。プロファイルが使用中の場合、もう一方のプロセスは自分専用の
->   使い捨てプロファイルへ自動的に切り替えます（`health_check`の
->   `profile_shared_fallback: true`）。同時に大量検索しないでください。
+> - 別々のMCPプロセスは1つのブラウザを共有します。最初に永続プロファイルの
+>   ロックを取ったプロセスがChrome/Xvfbを持ち、CDPエンドポイントを公開します。
+>   後から起動したプロセスはそのブラウザに接続（attach）するため、Nセッションでも
+>   ブラウザ一式は約600 MBの1つ分です。登録ファイルが無い・壊れている・古い
+>   場合は従来どおり自分専用の使い捨てプロファイルへ切り替わります
+>   （`health_check`の`profile_shared_fallback: true`）。同時に大量検索しないで
+>   ください。
 
 JavaScriptを実行できるChromeを使って、以下のMCPツールを提供するstdio
 サーバーです。
@@ -50,6 +53,12 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
 - 永続プロファイル: Cookieと同意状態が再起動後も残るため、Googleからは
   「初回訪問」ではなく「再訪したブラウザ」に見えます（`"profile": "ephemeral"`
   で従来の使い捨てプロファイルに戻せます）
+- プロファイル単位でブラウザを1つ共有: プロファイルのロックを取ったプロセスが
+  Chrome/Xvfbを持ち、CDPエンドポイントを`profile/.browser.json`（0600）に公開
+  します。後続のプロセスは自分のブラウザ（約600 MB）を起動せずそこへ接続します。
+  接続中のクライアントは`profile/clients/<pid>.json`のハートビートで通知し、
+  接続中のクライアントがある間はオーナーのアイドル解放は動きません。
+  `health_check`の`browser_role` / `owner_pid` / `clients`で状態を確認できます
 - 一貫性を優先したフィンガープリント調整: UA、`navigator.platform`、クライアント
   ヒント、WebGLのベンダー文字列を互いに矛盾しないように揃えます（`spoof_platform`）
 - Google検索の開始間隔、CAPTCHAクールダウン、時間あたりの検索予算を
@@ -205,7 +214,13 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 - `format`: `markdown`、`text`、`links`のいずれか
 - `min_delay` / `max_delay`: Google検索開始間隔の秒数。範囲内でランダム化
 - `profile`: `persistent`（既定）はCookieなどを保持する永続プロファイル、
-  `ephemeral`は従来の使い捨てプロファイル
+  `ephemeral`は従来の使い捨てプロファイル。永続プロファイルでは1プロセスだけが
+  ブラウザを保有し、そのCDPエンドポイントを`.browser.json`（0600）に公開します。
+  後続プロセスは自分のChrome/Xvfbを起動せずそのブラウザへ接続するため、Nセッション
+  でもブラウザ一式は1つ分（約600 MB）です。接続側はプロセスもロックも持たないため、
+  終了時にオーナーのChromeを止めることはありません。登録ファイルが使えない場合は
+  従来どおり使い捨てプロファイルへ切り替わります（`health_check`の
+  `profile_shared_fallback` / `browser_role` / `owner_pid` / `clients`）
 - `search_engines`: 試すエンジンの順序。`searxng`は`searxng_url`が必要
 - `searxng_url`: 自前のSearXNGのURL（例 `http://10.0.0.1:4000`、`format=json`許可が必要）
 - `human_input`: `true`（既定）でGoogleの検索ボックスに入力して検索
@@ -401,6 +416,13 @@ Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち時間、直近の�
 - `profile_mode`（`persistent`または`ephemeral`）、`profile_dir`、
   `profile_shared_fallback`（他プロセスが共有プロファイルを使用中で、自分専用の
   使い捨てプロファイルに切り替えた場合に`true`）
+- `browser_role`（`owner`はこのプロファイルのChrome/Xvfbを保有、`shared`は他
+  プロセスのブラウザに接続中、`none`はどちらでもない）、`owner_pid`（接続中
+  の場合のみ、オーナーのpid）、`clients`（接続中のクライアント数。オーナーのみ
+  報告し、それ以外は`null`）、`shared_attach_error`（接続を拒否した理由）。
+  接続前に、登録ファイルが本人所有・0600・既知バージョンであること、ループバックの
+  CDPエンドポイントであること、オーナーのpidと起動時刻が一致すること、
+  `Browser.getVersion`が応答することを検証します
 - `engines`（試行順）、`engine_cooldowns_s`（エンジンごとの残りクールダウン秒）、
   `searches_last_hour`、`max_searches_per_hour`、`budget_exhausted`
 - `human_input`と`spoof_platform`（現在のフィンガープリント設定）
@@ -443,7 +465,18 @@ CAPTCHAを解いてから同じ検索を再試行すると、次にGoogleが成�
 - 任意のページコンテキストJavaScriptを実行するツールは提供しません
 - ブラウザのHTTP(S)/WebSocket接続は公開アドレスに限定します
 - URL内の認証情報や明らかな秘密情報パターンを拒否します
-- サーバーごとにChromeと必要な表示backendを所有し、終了時に回収します
+- サーバーごとにChromeと必要な表示backendを所有し、終了時に回収します。
+  共有ブラウザに接続中のプロセスはChrome/Xvfbを起動せず、終了時も自分の
+  ハートビートファイルだけを削除します
+- 共有の登録ファイル`.browser.json`は、本人所有の0600の通常ファイルであること、
+  既知のバージョンであること、オーナーのpidと起動時刻が一致すること、ループバックの
+  CDPエンドポイントであること、`Browser.getVersion`が応答することを検証してから
+  使います。ページ通信のネットワークポリシーは変わりません（オーナーの公開ネット
+  ワーク検証プロキシを必ず通ります）
+- 既知の境界: オーナーのCDPエンドポイントは`127.0.0.1`で待ち受けるため、ブラウザ
+  稼働中は同一ホストのローカルユーザーからも到達できます（従来のプロセスごとの
+  ポートと同じ）。TCPリスナーを無くすChromeの`--remote-debugging-pipe`対応は
+  今後の課題です
 - Linuxは独立X11 display、macOSは独立temporary profileのnative/headless Chromeを使います
 - これは一般的なリモートブラウザ操作APIではありません
 

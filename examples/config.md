@@ -108,9 +108,15 @@ These keys are optional; the defaults below are what the server already uses.
 - `persistent` (default): one warm Chrome profile under
   `~/.cache/chrome-web-mcp/profile`. Cookies, consent state, and the cache
   survive between runs, so Google sees a returning browser instead of a new one.
-  Only one server process uses it at a time; a process that finds it busy falls
-  back to its own throwaway profile and reports `profile_shared_fallback: true`
-  from `health_check`. To reset it, stop the server and delete that directory.
+  Exactly one server process owns the browser; the owner publishes its CDP
+  endpoint in `.browser.json` (0600) and every later process attaches to that
+  browser instead of starting its own, so N sessions cost one ~600 MB browser
+  tree. An attached process starts no Chrome/Xvfb, keeps its own tabs, and
+  cannot kill the owner's processes when it exits. If that registry is missing
+  or unusable, a process that finds the profile busy falls back to its own
+  throwaway profile and reports `profile_shared_fallback: true` from
+  `health_check` (`browser_role` / `owner_pid` / `clients` describe the sharing
+  state). To reset it, stop the server and delete that directory.
 - `ephemeral`: the older behavior — a throwaway profile per process under
   `/tmp/chrome-web-v2-profile/<pid>`, removed on exit.
 
@@ -174,6 +180,13 @@ browser again transparently.
   browser stays up for the whole server session).
 - Any non-negative number of seconds is accepted; non-numeric or negative
   values warn on stderr and keep the default.
+
+The owner never releases the browser while another process is attached to it:
+attached clients refresh `PROFILE_DIR/clients/<pid>.json` on every browser tool
+call, and the reaper holds off until no heartbeat is younger than
+`idle_release_s` (heartbeats whose process died or that are malformed are
+removed). With no attached clients the behavior is exactly the single-process
+one described below.
 
 Measured on a Debian host (Chrome 155 + Xvfb): the released browser tree is
 about **600 MB** RSS (Chrome, renderers, GPU, network, Xvfb), a cold start
