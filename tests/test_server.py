@@ -749,6 +749,16 @@ def test_smart_cut_keeps_short_text():
     assert (cut, truncated) == ("hello", False)
 
 
+def test_markdown_fallback_accumulates_length_linearly():
+    """F10: the DOM-walk fallback must not re-join the parts every iteration."""
+    script = server._FETCH_MD_JS
+    loop = script[script.index("for (const el of"):script.index("let markdown = parts.join")]
+
+    assert "parts.join" not in loop
+    assert "total +=" in loop
+    assert "if (total > 300000) break;" in loop
+
+
 def test_smart_cut_prefers_sentence_boundary():
     cut, truncated = server._smart_cut("First sentence. Second sentence here", 20)
     assert truncated is True
