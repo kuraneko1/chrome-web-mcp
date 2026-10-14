@@ -25,15 +25,23 @@ _SECRET_RE = re.compile(
 _BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "metadata.goog"}
 
 
-def _is_google_challenge(url: str, text: str) -> bool:
-    """Detect Google's challenge page without treating ordinary result text as one."""
+def _is_google_challenge(url: str, challenge_text: str) -> bool:
+    """Detect Google's challenge page from the URL and the challenge UI's text.
+
+    ``challenge_text`` must come from the structural DOM probe
+    (``cdp._PAGE_CHALLENGE_PROBE_JS``), never from whole-page text: a normal
+    result page for the query "captcha" contains that word in a snippet, so
+    scanning the body marked ordinary searches as challenges (F1). The phrase
+    list below only disambiguates text that already came out of a challenge
+    container, which is why it cannot be tripped by a result page.
+    """
     parsed = urllib.parse.urlparse(url)
     if not _is_google_host(parsed.hostname):
         return False
     path = parsed.path.lower()
     if path == "/sorry" or path.startswith("/sorry/"):
         return True
-    normalized = " ".join(text.lower().split())
+    normalized = " ".join(challenge_text.lower().split())
     return any(
         phrase in normalized
         for phrase in (

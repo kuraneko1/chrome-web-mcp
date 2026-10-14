@@ -248,9 +248,15 @@ def parse_searxng(payload: dict, limit: int) -> list[dict]:
     return out
 
 
-def looks_blocked(engine: str, page_text: str) -> bool:
-    """Report whether a rendered page is a bot challenge rather than results."""
-    normalized = " ".join((page_text or "").lower().split())
+def looks_blocked(engine: str, challenge_text: str) -> bool:
+    """Report whether a *challenge container's* text is a bot challenge.
+
+    ``challenge_text`` must come from the structural DOM probe
+    (``cdp._PAGE_CHALLENGE_PROBE_JS``); feeding it the whole page body marked
+    ordinary result pages as blocked whenever a snippet mentioned a CAPTCHA
+    (F1).
+    """
+    normalized = " ".join((challenge_text or "").lower().split())
     if not normalized:
         return False
     return any(phrase in normalized for phrase in _BLOCK_PHRASES)

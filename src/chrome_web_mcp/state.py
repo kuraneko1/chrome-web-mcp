@@ -133,6 +133,11 @@ class SearchEngineState:
         self.cooldown_max_s = max(self.cooldown_s, cooldown_max_s)
         self.budget = max(0, budget)
 
+    # Cap the persisted strike count: ``2 ** (strikes - 1)`` is unbounded for a
+    # corrupted or hostile row, and only burns CPU (the cooldown itself is
+    # already capped by cooldown_max_s).
+    _MAX_STRIKES = 32
+
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         connection = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
@@ -162,6 +167,7 @@ class SearchEngineState:
                 "SELECT strikes FROM engine_state WHERE engine = ?", (engine,)
             ).fetchone()
             strikes = int(row[0]) + 1 if row else 1
+            strikes = min(strikes, self._MAX_STRIKES)
             cooldown = min(self.cooldown_s * (2 ** (strikes - 1)), self.cooldown_max_s)
             connection.execute(
                 "INSERT INTO engine_state(engine, strikes, cooldown_until, updated_at) "

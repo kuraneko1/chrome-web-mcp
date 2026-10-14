@@ -55,6 +55,7 @@ from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
 from chrome_web_mcp.cdp import (
     MAX_ENGINE_HTML_CHARS,
     _CDP_IDS,
+    _PAGE_CHALLENGE_PROBE_JS,
     _cdp_call,
     _click_google_consent,
     _evaluate,
@@ -982,8 +983,10 @@ async def _read_google_results(page: Any) -> list[dict]:
     final_url = str(await _evaluate(page, "location.href"))
     if not _is_google_host(urllib.parse.urlparse(final_url).hostname):
         raise RuntimeError("Google navigation left the allowed origin")
-    body_text = str(await _evaluate(page, "document.body?.innerText || ''"))
-    if _is_google_challenge(final_url, body_text):
+    # Structural challenge decision (F1): only the challenge UI's own text is
+    # considered, so a result page about CAPTCHAs is not mistaken for one.
+    challenge_text = str(await _evaluate(page, _PAGE_CHALLENGE_PROBE_JS) or "")
+    if _is_google_challenge(final_url, challenge_text):
         global _LAST_CAPTCHA_TS
         _LAST_CAPTCHA_TS = time.time()
         if _xpra_expose_enabled():
@@ -1032,8 +1035,8 @@ async def _fetch_engine_candidates(
         url = engines.engine_url(engine, query, hl, gl, count=max(limit * 2, 10))
         await _cdp_call(page, "Page.navigate", {"url": url})
         await _wait_ready(page)
-        body_text = str(await _evaluate(page, "document.body?.innerText || ''"))
-        if engines.looks_blocked(engine, body_text):
+        challenge_text = str(await _evaluate(page, _PAGE_CHALLENGE_PROBE_JS) or "")
+        if engines.looks_blocked(engine, challenge_text):
             raise CaptchaRequired(
                 f"{engine} returned a bot challenge page instead of results."
             )

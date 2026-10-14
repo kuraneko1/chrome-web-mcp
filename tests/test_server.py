@@ -70,6 +70,39 @@ def test_google_challenge_is_detected_from_url_or_rendered_text():
     assert not server._is_google_challenge("https://www.google.com/search?q=x", "Normal search results")
 
 
+def test_google_results_ask_the_structural_probe_instead_of_the_body(monkeypatch):
+    """F1: challenge detection must not scan ordinary result text."""
+    expressions = []
+
+    async def fake_evaluate(conn, expr):
+        expressions.append(expr)
+        if expr == "location.href":
+            return "https://www.google.com/search?q=captcha"
+        return ""
+
+    async def fake_read(conn, expr):
+        return "[]"
+
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(server, "_read_page_string", fake_read)
+
+    assert run_async(server._read_google_results(object())) == []
+    assert server._PAGE_CHALLENGE_PROBE_JS in expressions
+    assert "document.body?.innerText || ''" not in expressions
+
+
+def test_structural_probe_hit_raises_captcha_required(monkeypatch):
+    async def fake_evaluate(conn, expr):
+        if expr == "location.href":
+            return "https://www.google.com/search?q=x"
+        return "Our systems have detected unusual traffic from your computer network"
+
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+
+    with pytest.raises(server.CaptchaRequired):
+        run_async(server._read_google_results(object()))
+
+
 def test_human_display_environment_uses_real_x11_display(monkeypatch):
     monkeypatch.setenv("DISPLAY", ":0")
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")

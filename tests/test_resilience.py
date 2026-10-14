@@ -60,6 +60,30 @@ def test_success_clears_the_cooldown(state):
     assert state.note_challenge("google") == 10.0  # strikes reset
 
 
+def test_hostile_strike_count_is_clamped(tmp_path):
+    """F1: a huge persisted strike count must not feed an unbounded 2**N."""
+    state = server.SearchEngineState(tmp_path / "s.sqlite3", cooldown_s=1.0, cooldown_max_s=60.0)
+    connection = state._connect()
+    try:
+        connection.execute(
+            "INSERT INTO engine_state(engine, strikes, cooldown_until, updated_at) "
+            "VALUES('google', ?, 0, 0)",
+            (10 ** 9,),
+        )
+    finally:
+        connection.close()
+
+    assert state.note_challenge("google") == 60.0
+    connection = state._connect()
+    try:
+        row = connection.execute(
+            "SELECT strikes FROM engine_state WHERE engine = 'google'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row[0] == server.SearchEngineState._MAX_STRIKES
+
+
 def test_expired_cooldown_reports_zero(state, monkeypatch):
     state.note_challenge("google")
     future = time.time() + 3600
