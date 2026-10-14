@@ -356,6 +356,106 @@ def test_build_results_deduplicates_and_honors_limit():
     ]
 
 
+def test_download_policy_is_denied_on_the_browser_session(monkeypatch):
+    """F3: every browser-level CDP session must refuse downloads."""
+    calls = []
+
+    async def fake_cdp(conn, method, params=None):
+        calls.append((method, params))
+        return {}
+
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+
+    run_async(server._deny_downloads(object()))
+
+    assert calls == [
+        ("Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": False})
+    ]
+
+
+def test_unsupported_download_policy_is_not_fatal(monkeypatch):
+    """An older Chrome that lacks the method must not break fetch_url."""
+    async def fake_cdp(conn, method, params=None):
+        raise RuntimeError("CDP failed: 'Browser.setDownloadBehavior' wasn't found")
+
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+
+    run_async(server._deny_downloads(object()))
+
+
+def test_fetch_page_sets_the_download_policy_before_navigating(monkeypatch):
+    methods = []
+
+    async def fake_ensure():
+        return "ws://127.0.0.1:1/devtools/browser/x"
+
+    class FakeConn:
+        async def send(self, msg):
+            pass
+
+        async def recv(self):
+            return '{"id": 1, "result": {}}'
+
+        async def close(self):
+            pass
+
+    async def fake_connect(*args, **kwargs):
+        return FakeConn()
+
+    async def fake_cdp(conn, method, params=None):
+        methods.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "fetch-tab"}
+        return {}
+
+    async def fake_evaluate(conn, expr):
+        if "location.href" in expr:
+            return "https://example.com/"
+        if "clone" in expr:
+            return '{"title": "t", "text": "hello"}'
+        return "[]"
+
+    async def fake_wait(conn):
+        return None
+
+    async def fake_to_thread(fn, *a, **k):
+        result = fn(*a, **k)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    runtime = server.BrowserRuntime()
+    runtime.port = 1
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(server, "_read_page_string", fake_evaluate)
+    monkeypatch.setattr(server, "_wait_ready", fake_wait)
+    monkeypatch.setattr(server, "_validate_public_url", lambda u: u)
+    monkeypatch.setattr(server.websockets, "connect", fake_connect)
+    monkeypatch.setattr(server.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(runtime, "ensure", fake_ensure)
+
+    result = run_async(server._fetch_page("https://example.com/", 500))
+
+    assert result["text"] == "hello"
+    assert methods.index("Browser.setDownloadBehavior") < methods.index("Target.createTarget")
+
+
+def test_chrome_command_bounds_the_disk_cache(monkeypatch):
+    """F3: an unbounded cache is the other half of the download problem."""
+
+    class FakeProxy:
+        url = "http://127.0.0.1:12345"
+
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
+    monkeypatch.setattr(server.BrowserRuntime, "_chrome_executable", staticmethod(lambda: "/bin/echo"))
+    runtime = server.BrowserRuntime()
+    runtime.proxy = FakeProxy()
+
+    assert "--disk-cache-size=67108864" in runtime._chrome_command()
+
+
 def test_fetch_page_runs_concurrent_calls_on_separate_tabs(monkeypatch):
     navigated = []
     in_section = {"active": 0, "max": 0}

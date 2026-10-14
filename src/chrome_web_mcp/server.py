@@ -708,6 +708,9 @@ class BrowserRuntime:
             "--proxy-bypass-list=<-loopback>",
             "--disable-quic",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            # Bound the HTTP cache: downloads are denied per session (F3), but a
+            # fetched page could otherwise fill the profile's disk cache.
+            "--disk-cache-size=67108864",
             f"--user-data-dir={PROFILE_DIR}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -979,6 +982,24 @@ async def _apply_fingerprint_override(page: Any) -> None:
         pass
 
 
+async def _deny_downloads(browser: Any) -> None:
+    """Refuse browser-initiated downloads on the browser session (F3).
+
+    Without this, a ``Content-Disposition: attachment`` response is written to
+    the user's disk by the browser process and closing the tab does not cancel
+    the transfer. Older Chrome builds may not know the method; the bounded
+    ``--disk-cache-size`` still applies there, so a failure is not fatal.
+    """
+    try:
+        await _cdp_call(
+            browser,
+            "Browser.setDownloadBehavior",
+            {"behavior": "deny", "eventsEnabled": False},
+        )
+    except Exception:
+        pass
+
+
 async def _read_google_results(page: Any) -> list[dict]:
     """Validate the current Google page and extract result candidates."""
     final_url = str(await _evaluate(page, "location.href"))
@@ -1016,6 +1037,7 @@ async def _fetch_engine_candidates(
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    await _deny_downloads(browser)
     page: Any = None
     try:
         try:
@@ -1186,6 +1208,7 @@ async def _extract_google_candidates(
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
     await _collect_gpu_info(browser)
+    await _deny_downloads(browser)
     page: Any = None
     try:
         try:
@@ -1388,6 +1411,7 @@ async def _fetch_page(url: str, char_limit: int, format: str = "text") -> dict:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
     await _collect_gpu_info(browser)
+    await _deny_downloads(browser)
     page: Any = None
     target_id: str | None = None
     try:
