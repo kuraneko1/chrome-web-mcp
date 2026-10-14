@@ -6,6 +6,18 @@ native/headless Chrome on macOS), renders pages with JavaScript through CDP, and
 exposes a stateless Google search tool plus a public-URL fetch tool. Fetch
 targets and their post-redirect final URLs are validated fail-closed; arbitrary
 page-context JavaScript is never exposed.
+
+Module map (this module keeps the browser runtime, profile/lock management,
+search and fallback orchestration, the MCP tool surface, health reporting and
+main/run, and re-exports the names tests patch on ``chrome_web_mcp.server``):
+  * config.py    - config defaults and optional JSON config-file loading
+  * state.py     - shared rate limiter, engine cooldowns/budget, env helpers
+  * urlpolicy.py - secret/host checks, public-URL validation, href normalization
+  * cdp.py       - CDP request framing, JS evaluation, page snapshots
+  * extract.py   - in-page extraction JavaScript, shaped markdown, smart cuts
+  * results.py   - engine candidate normalization and result shaping
+  * errors.py    - CaptchaRequired and SearchFailed
+  * processes.py - owned-process identity and teardown
 """
 
 from __future__ import annotations
@@ -14,24 +26,19 @@ import asyncio
 import atexit
 import collections
 import fcntl
-import ipaddress
-import itertools
 import json
 import os
-import random
 import re
 import select
 import shutil
 import signal
-import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 import mcp.types as types
@@ -42,14 +49,45 @@ from chrome_web_mcp.network import PublicNetworkProxy
 from chrome_web_mcp import engines
 from chrome_web_mcp import platform_runtime
 
-try:
-    import trafilatura
-except ImportError:  # pragma: no cover - dependency declared in pyproject
-    trafilatura = None  # type: ignore[assignment]
-try:
-    import html2text
-except ImportError:  # pragma: no cover - dependency declared in pyproject
-    html2text = None  # type: ignore[assignment]
+# ``_CONFIG_DEFAULTS`` is re-exported for tests; ``_load_config`` builds CONFIG below.
+from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
+# Re-exported: the page-driving call sites below use these; tests patch them.
+from chrome_web_mcp.cdp import (
+    MAX_ENGINE_HTML_CHARS,
+    _CDP_IDS,
+    _cdp_call,
+    _click_google_consent,
+    _evaluate,
+    _read_page_html,
+    _read_page_string,
+    _type_google_query,
+    _wait_ready,
+)
+# Re-exported: callers and tests catch these as attributes of this module.
+from chrome_web_mcp.errors import CaptchaRequired, SearchFailed
+# Re-exported: _fetch_page/_read_google_results (kept here) and tests use these.
+from chrome_web_mcp.extract import (
+    MAX_EXTRACTION_CHARS,
+    _EXTRACT_RESULTS_JS,
+    _FETCH_LINKS_JS,
+    _FETCH_MD_JS,
+    _FETCH_TEXT_JS,
+    _shape_markdown,
+    _smart_cut,
+)
+# Re-exported for tests; _stop_recorded_process (kept here) calls _process_identity.
+from chrome_web_mcp.processes import _process_identity, _terminate_owned_process
+# Re-exported: the search orchestrators below call these with _resolve_candidate_url.
+from chrome_web_mcp.results import _build_results, _normalize_candidates
+# Re-exported for tests; the instances below stay here (patch targets).
+from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag
+# Re-exported: _resolve_candidate_url (kept here) and tests call these.
+from chrome_web_mcp.urlpolicy import (
+    _is_google_challenge,
+    _is_google_host,
+    _normalize_candidate_href,
+    _validate_public_url,
+)
 
 HERE = Path(__file__).resolve().parent
 
@@ -101,88 +139,8 @@ def _activate_profile(path: Path, *, ephemeral: bool) -> None:
     DEVTOOLS_FILE = PROFILE_DIR / "DevToolsActivePort"
     _PROFILE_EPHEMERAL = ephemeral
 MAX_CDP_MESSAGE = 2 * 1024 * 1024
-MAX_EXTRACTION_CHARS = 16 * 1024 * 1024
 
 app = Server("chrome-web")
-
-_SECRET_RE = re.compile(
-    r"(?:sk-|ghp_|github_pat_|xox[baprs]-|AIza|hf_|pplx-|tvly-|exa_|xai-)[A-Za-z0-9_-]{10,}",
-    re.IGNORECASE,
-)
-_BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "metadata.goog"}
-_CDP_IDS = itertools.count(1)
-
-
-class CaptchaRequired(RuntimeError):
-    """The Google page requires a human interaction before search can continue."""
-
-
-def _is_google_challenge(url: str, text: str) -> bool:
-    """Detect Google's challenge page without treating ordinary result text as one."""
-    parsed = urllib.parse.urlparse(url)
-    if not _is_google_host(parsed.hostname):
-        return False
-    path = parsed.path.lower()
-    if path == "/sorry" or path.startswith("/sorry/"):
-        return True
-    normalized = " ".join(text.lower().split())
-    return any(
-        phrase in normalized
-        for phrase in (
-            "our systems have detected unusual traffic",
-            "unusual traffic from your computer network",
-            "automated queries",
-            "not a robot",
-            "captcha",
-        )
-    )
-
-
-def _is_google_host(host: str | None) -> bool:
-    normalized = (host or "").lower().rstrip(".")
-    return normalized == "google.com" or normalized.endswith(".google.com")
-
-
-def _validate_public_url(url: str) -> str:
-    """Return a public HTTP(S) URL or raise a fail-closed validation error."""
-    if _SECRET_RE.search(url) or _SECRET_RE.search(urllib.parse.unquote(url)):
-        raise ValueError("Blocked: URL contains a credential-like value")
-    try:
-        parsed = urllib.parse.urlparse(url)
-        host = (parsed.hostname or "").lower().rstrip(".")
-    except ValueError as exc:
-        raise ValueError("Blocked: malformed URL") from exc
-    if parsed.scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
-        raise ValueError("Blocked: only public HTTP(S) URLs without credentials are allowed")
-    if host in _BLOCKED_HOSTS or host.endswith(".localhost") or host.endswith(".local"):
-        raise ValueError("Blocked: local or metadata hostname")
-    try:
-        addresses = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            addresses = {
-                ipaddress.ip_address(item[4][0])
-                for item in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
-            }
-        except OSError as exc:
-            raise ValueError("Blocked: hostname could not be resolved safely") from exc
-    if not addresses or any(not address.is_global for address in addresses):
-        raise ValueError("Blocked: URL resolves to a non-public address")
-    return urllib.parse.urlunparse(parsed)
-
-
-def _normalize_candidate_href(href: str) -> str | None:
-    """Normalize direct and legacy Google result links without fetching them."""
-    try:
-        parsed = urllib.parse.urlparse(href)
-    except ValueError:
-        return None
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return None
-    if _is_google_host(parsed.hostname) and parsed.path == "/url":
-        target = urllib.parse.parse_qs(parsed.query).get("q", [None])[0]
-        return _normalize_candidate_href(target) if target else None
-    return href
 
 
 async def _resolve_candidate_url(href: str) -> str | None:
@@ -221,64 +179,6 @@ async def _resolve_candidate_url(href: str) -> str | None:
     return None
 
 
-async def _build_results(
-    candidates: list[dict],
-    limit: int,
-    *,
-    resolve_url: Callable[[str], Awaitable[str | None]],
-) -> list[dict]:
-    results: list[dict] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        title = " ".join(str(candidate.get("title", "")).split())
-        href = str(candidate.get("href", ""))
-        description = " ".join(str(candidate.get("description", "")).split())
-        if not title or not href:
-            continue
-        try:
-            url = await resolve_url(href)
-        except (ValueError, OSError, httpx.HTTPError):
-            continue
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        results.append(
-            {
-                "title": title[:300],
-                "url": url,
-                "description": description[:1000],
-                "position": len(results) + 1,
-            }
-        )
-        if len(results) >= limit:
-            break
-    return results
-
-
-def _terminate_owned_process(proc: subprocess.Popen | None, timeout: float) -> None:
-    """Stop an owned process group without ever raising during teardown.
-
-    macOS reports EPERM from killpg while a crashed child is being reaped; a
-    cleanup path that raised there would mask the original failure.
-    """
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=timeout)
-    except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=2)
-        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
-            pass
-
-
-def _process_identity(pid: int) -> dict:
-    """Identify a same-user process without relying on a reusable PID alone."""
-    return platform_runtime.process_identity(pid)
-
-
 def _stop_recorded_process(record: dict) -> None:
     """Stop only a same-user process group whose leader identity still matches."""
     try:
@@ -295,181 +195,6 @@ def _stop_recorded_process(record: dict) -> None:
             os.killpg(pid, signal.SIGKILL)
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         return
-
-
-_CONFIG_DEFAULTS = {
-    "show_browser": True,  # Linux: Xephyr/Xvfb | macOS: native/headless
-    "hl": "ja",
-    "gl": "jp",
-    "limit": 5,
-    "char_limit": 15000,
-    "format": "markdown",
-    "min_delay": 1.0,
-    "max_delay": 2.5,
-    # Profile lifetime: "persistent" keeps cookies/consent between runs (fewer
-    # CAPTCHAs), "ephemeral" restores the throwaway per-pid profile.
-    "profile": "persistent",
-    # Engine order. Google is first, but the rest absorb a CAPTCHA so a search
-    # still returns results instead of failing.
-    "search_engines": ["google", "ddg", "brave", "bing"],
-    # Self-hosted SearXNG base URL (enables the "searxng" engine when listed).
-    "searxng_url": "",
-    # Type the query into the Google box instead of navigating to /search?q=.
-    "human_input": True,
-    # Google-only safety valves: hourly budget and CAPTCHA cooldown.
-    "max_searches_per_hour": 60,  # 0 disables the budget
-    "captcha_cooldown_s": 300,
-    "captcha_cooldown_max_s": 1800,
-    # Platform fingerprint: "native" keeps Linux UA/platform consistent;
-    # "windows" applies a matching Windows UA + platform + client hints.
-    "spoof_platform": "native",
-    # Keep Chrome's software rendering (stable on headless/CI hosts). Turn off
-    # to let Chrome use the host GPU.
-    "disable_gpu": True,
-}
-
-
-def _warn_config(message: str) -> None:
-    try:
-        print(f"chrome-web-mcp: config: {message}", file=sys.stderr)
-    except Exception:
-        pass
-
-
-def _load_config() -> dict:
-    """Load the optional JSON config file; fall back to defaults per key.
-
-    Path from CW_CONFIG, else ~/.config/chrome-web-mcp/config.json when it
-    exists. Invalid keys/values warn on stderr and keep the default value.
-    """
-    raw_path = os.environ.get("CW_CONFIG", "").strip()
-    path = Path(raw_path).expanduser() if raw_path else (
-        Path.home() / ".config" / "chrome-web-mcp" / "config.json"
-    )
-    cfg: dict[str, Any] = dict(_CONFIG_DEFAULTS)
-    if not path.is_file():
-        if raw_path:
-            _warn_config(f"{path} not found; using defaults")
-        return cfg
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        _warn_config(f"cannot parse {path} ({exc}); using defaults")
-        return cfg
-    if not isinstance(data, dict):
-        _warn_config(f"{path} must be a JSON object; using defaults")
-        return cfg
-    for key in data:
-        if key not in _CONFIG_DEFAULTS:
-            _warn_config(f"unknown key {key!r} ignored")
-    if "show_browser" in data:
-        value = data["show_browser"]
-        if isinstance(value, bool):
-            cfg["show_browser"] = value
-        else:
-            _warn_config("show_browser must be true or false; using default")
-    for key in ("hl", "gl"):
-        if key in data:
-            value = data[key]
-            if isinstance(value, str) and re.fullmatch(r"[A-Za-z-]{2,8}", value.strip()):
-                cfg[key] = value.strip()
-            else:
-                _warn_config(f"{key} must be a 2-8 letter code; using default")
-    if "limit" in data:
-        value = data["limit"]
-        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 20:
-            cfg["limit"] = value
-        else:
-            _warn_config("limit must be an integer from 1 to 20; using default")
-    if "char_limit" in data:
-        value = data["char_limit"]
-        if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 200000:
-            cfg["char_limit"] = value
-        else:
-            _warn_config("char_limit must be an integer from 100 to 200000; using default")
-    if "format" in data:
-        if data["format"] in ("text", "markdown", "links"):
-            cfg["format"] = data["format"]
-        else:
-            _warn_config("format must be text, markdown, or links; using default")
-    delays: dict[str, float] = {}
-    for key in ("min_delay", "max_delay"):
-        if key in data:
-            value = data[key]
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                delays[key] = float(value)
-            else:
-                _warn_config(f"{key} must be a non-negative number; using default")
-    if delays:
-        lo = delays["min_delay"] if "min_delay" in delays else float(cfg["min_delay"])
-        hi = delays["max_delay"] if "max_delay" in delays else float(cfg["max_delay"])
-        if hi >= lo:
-            cfg.update(delays)
-        else:
-            _warn_config("max_delay must be >= min_delay; using defaults")
-    if "profile" in data:
-        value = str(data["profile"]).strip().lower()
-        if value in ("persistent", "ephemeral"):
-            cfg["profile"] = value
-        else:
-            _warn_config("profile must be persistent or ephemeral; using default")
-    if "search_engines" in data:
-        value = data["search_engines"]
-        if isinstance(value, list) and all(isinstance(item, str) for item in value):
-            valid = set(engines.BROWSER_ENGINES) | set(engines.HTTP_ENGINES)
-            picked = [item.strip().lower() for item in value]
-            unknown = sorted({item for item in picked if item not in valid})
-            if unknown:
-                _warn_config(f"unknown search_engines entries ignored: {unknown}")
-            usable = [item for item in picked if item in valid]
-            if usable:
-                cfg["search_engines"] = usable
-            else:
-                _warn_config("search_engines listed no usable engine; using default")
-        else:
-            _warn_config("search_engines must be a list of engine names; using default")
-    if "searxng_url" in data:
-        value = data["searxng_url"]
-        if isinstance(value, str) and (
-            not value.strip() or value.strip().startswith(("http://", "https://"))
-        ):
-            cfg["searxng_url"] = value.strip().rstrip("/")
-        else:
-            _warn_config("searxng_url must be an http(s) URL; using default")
-    for key in ("human_input", "disable_gpu"):
-        if key in data:
-            if isinstance(data[key], bool):
-                cfg[key] = data[key]
-            else:
-                _warn_config(f"{key} must be true or false; using default")
-    if "spoof_platform" in data:
-        value = str(data["spoof_platform"]).strip().lower()
-        if value in ("native", "windows"):
-            cfg["spoof_platform"] = value
-        else:
-            _warn_config("spoof_platform must be native or windows; using default")
-    if "max_searches_per_hour" in data:
-        value = data["max_searches_per_hour"]
-        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10000:
-            cfg["max_searches_per_hour"] = value
-        else:
-            _warn_config("max_searches_per_hour must be an integer from 0 to 10000; using default")
-    cooldowns: dict[str, float] = {}
-    for key in ("captcha_cooldown_s", "captcha_cooldown_max_s"):
-        if key in data:
-            value = data[key]
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                cooldowns[key] = float(value)
-            else:
-                _warn_config(f"{key} must be a non-negative number; using default")
-    if cooldowns:
-        lo = cooldowns.get("captcha_cooldown_s", float(cfg["captcha_cooldown_s"]))
-        hi = cooldowns.get("captcha_cooldown_max_s", float(cfg["captcha_cooldown_max_s"]))
-        if hi >= lo:
-            cfg.update(cooldowns)
-        else:
-            _warn_config("captcha_cooldown_max_s must be >= captcha_cooldown_s; using defaults")
-    return cfg
 
 
 CONFIG = _load_config()
@@ -1114,77 +839,6 @@ class BrowserRuntime:
                 self.lock_file = None
 
 
-def _env_float(name: str, default: float) -> float:
-    """Read a float env override, falling back to default on unset/invalid."""
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-class SharedSearchRateLimiter:
-    """Reserve globally spaced Google-search start slots across processes."""
-
-    _BUCKET = "google_search"
-
-    def __init__(
-        self,
-        db_path: str | Path | None = None,
-        *,
-        min_delay: float | None = None,
-        max_delay: float | None = None,
-    ) -> None:
-        if min_delay is None:
-            min_delay = _env_float("CW_MIN_DELAY", float(CONFIG["min_delay"]))
-        if max_delay is None:
-            max_delay = _env_float("CW_MAX_DELAY", float(CONFIG["max_delay"]))
-        if min_delay < 0 or max_delay < min_delay:
-            raise ValueError("invalid search rate-limit delay range")
-        default_path = Path(tempfile.gettempdir()) / "chrome-web-mcp" / "search-rate-limit.sqlite3"
-        configured = os.environ.get("CW_RATE_LIMIT_DB")
-        self.db_path = Path(db_path or configured or default_path)
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-
-    def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        connection = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
-        connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS rate_limit ("
-            "bucket TEXT PRIMARY KEY, next_at REAL NOT NULL)"
-        )
-        return connection
-
-    def reserve_slot(self) -> float:
-        """Atomically reserve a slot and return seconds to wait before starting."""
-        now = time.time()
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT next_at FROM rate_limit WHERE bucket = ?", (self._BUCKET,)
-            ).fetchone()
-            previous = float(row[0]) if row else now
-            slot = max(now, previous)
-            next_at = slot + random.uniform(self.min_delay, self.max_delay)
-            connection.execute(
-                "INSERT INTO rate_limit(bucket, next_at) VALUES(?, ?) "
-                "ON CONFLICT(bucket) DO UPDATE SET next_at=excluded.next_at",
-                (self._BUCKET, next_at),
-            )
-            connection.commit()
-            return max(0.0, slot - now)
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-
 _RUNTIME = BrowserRuntime()
 # Reap crash/kill -9 leftovers from previous sessions (dead per-pid profile
 # dirs and their orphaned Chrome/display processes) before this session needs a browser.
@@ -1192,7 +846,7 @@ BrowserRuntime._sweep_orphans()
 
 # Serialize searches within this process and reserve a shared inter-process slot.
 _SEARCH_LOCK = asyncio.Lock()
-_SEARCH_LIMITER = SharedSearchRateLimiter()
+_SEARCH_LIMITER = SharedSearchRateLimiter(config=CONFIG)
 # Serialize browser lifecycle (ensure/cleanup/lock) across search AND fetch:
 # ensure() is blocking and not reentrant, so a search racing a fetch would
 # cleanup() the other's starting browser and then fail on the profile lock.
@@ -1231,163 +885,8 @@ def _pace_warning(count: int) -> str | None:
     return None
 
 
-class SearchEngineState:
-    """Cross-process engine health: CAPTCHA cooldowns and an hourly budget.
-
-    Stored next to the pacing table so separate MCP processes agree on which
-    engines are temporarily unusable. Only Google is throttled - the fallback
-    engines exist precisely to keep searches working while Google cools down.
-    """
-
-    def __init__(
-        self,
-        db_path: str | Path | None = None,
-        *,
-        cooldown_s: float | None = None,
-        cooldown_max_s: float | None = None,
-        budget: int | None = None,
-    ) -> None:
-        default_path = Path(tempfile.gettempdir()) / "chrome-web-mcp" / "search-rate-limit.sqlite3"
-        configured = os.environ.get("CW_RATE_LIMIT_DB")
-        self.db_path = Path(db_path or configured or default_path)
-        if cooldown_s is None:
-            cooldown_s = _env_float("CW_CAPTCHA_COOLDOWN", float(CONFIG["captcha_cooldown_s"]))
-        if cooldown_max_s is None:
-            cooldown_max_s = _env_float(
-                "CW_CAPTCHA_COOLDOWN_MAX", float(CONFIG["captcha_cooldown_max_s"])
-            )
-        if budget is None:
-            raw = os.environ.get("CW_MAX_SEARCHES_PER_HOUR", "").strip()
-            try:
-                budget = int(raw) if raw else int(CONFIG["max_searches_per_hour"])
-            except ValueError:
-                budget = int(CONFIG["max_searches_per_hour"])
-        self.cooldown_s = max(0.0, cooldown_s)
-        self.cooldown_max_s = max(self.cooldown_s, cooldown_max_s)
-        self.budget = max(0, budget)
-
-    def _connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        connection = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
-        connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS engine_state ("
-            "engine TEXT PRIMARY KEY, strikes INTEGER NOT NULL DEFAULT 0, "
-            "cooldown_until REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0)"
-        )
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS search_log ("
-            "ts REAL NOT NULL, engine TEXT NOT NULL)"
-        )
-        return connection
-
-    def note_challenge(self, engine: str) -> float:
-        """Record a challenge; return the cooldown applied (seconds).
-
-        Repeated challenges back off exponentially so an aggressive client stops
-        hammering Google instead of walking into a longer ban.
-        """
-        now = time.time()
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT strikes FROM engine_state WHERE engine = ?", (engine,)
-            ).fetchone()
-            strikes = int(row[0]) + 1 if row else 1
-            cooldown = min(self.cooldown_s * (2 ** (strikes - 1)), self.cooldown_max_s)
-            connection.execute(
-                "INSERT INTO engine_state(engine, strikes, cooldown_until, updated_at) "
-                "VALUES(?, ?, ?, ?) ON CONFLICT(engine) DO UPDATE SET "
-                "strikes=excluded.strikes, cooldown_until=excluded.cooldown_until, "
-                "updated_at=excluded.updated_at",
-                (engine, strikes, now + cooldown, now),
-            )
-            connection.commit()
-            return cooldown
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def note_success(self, engine: str) -> None:
-        """Clear the cooldown and the strike count after a clean search."""
-        connection = self._connect()
-        try:
-            connection.execute(
-                "INSERT INTO engine_state(engine, strikes, cooldown_until, updated_at) "
-                "VALUES(?, 0, 0, ?) ON CONFLICT(engine) DO UPDATE SET "
-                "strikes=0, cooldown_until=0, updated_at=excluded.updated_at",
-                (engine, time.time()),
-            )
-        finally:
-            connection.close()
-
-    def cooldown_remaining(self, engine: str) -> float:
-        try:
-            connection = self._connect()
-            try:
-                row = connection.execute(
-                    "SELECT cooldown_until FROM engine_state WHERE engine = ?", (engine,)
-                ).fetchone()
-            finally:
-                connection.close()
-        except Exception:
-            return 0.0
-        if not row:
-            return 0.0
-        return max(0.0, float(row[0]) - time.time())
-
-    def note_search(self, engine: str) -> None:
-        connection = self._connect()
-        try:
-            connection.execute("INSERT INTO search_log(ts, engine) VALUES(?, ?)", (time.time(), engine))
-            connection.execute("DELETE FROM search_log WHERE ts < ?", (time.time() - 7200,))
-        finally:
-            connection.close()
-
-    def searches_last_hour(self) -> int:
-        try:
-            connection = self._connect()
-            try:
-                row = connection.execute(
-                    "SELECT COUNT(*) FROM search_log WHERE ts >= ?", (time.time() - 3600,)
-                ).fetchone()
-            finally:
-                connection.close()
-        except Exception:
-            return 0
-        return int(row[0]) if row else 0
-
-    def budget_exhausted(self) -> bool:
-        if self.budget <= 0:
-            return False
-        return self.searches_last_hour() >= self.budget
-
-    def snapshot(self) -> dict:
-        return {
-            "cooldowns": {"google": round(self.cooldown_remaining("google"), 1)},
-            "searches_last_hour": self.searches_last_hour(),
-            "max_searches_per_hour": self.budget,
-            "budget_exhausted": self.budget_exhausted(),
-        }
-
-
 # Shared engine health (CAPTCHA cooldowns, hourly budget) across processes.
-_ENGINE_STATE = SearchEngineState()
-
-
-async def _cdp_call(connection: Any, method: str, params: dict | None = None) -> dict:
-    request_id = next(_CDP_IDS)
-    await connection.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
-    while True:
-        raw = await asyncio.wait_for(connection.recv(), timeout=25)
-        message = json.loads(raw)
-        if message.get("id") == request_id:
-            if "error" in message:
-                raise RuntimeError(f"CDP {method} failed: {message['error']}")
-            return message.get("result", {})
+_ENGINE_STATE = SearchEngineState(config=CONFIG)
 
 
 async def _collect_gpu_info(browser: Any) -> None:
@@ -1431,86 +930,6 @@ async def _collect_gpu_info(browser: Any) -> None:
     except Exception:
         # Diagnostics must never make browser/search/fetch unavailable.
         return
-
-
-async def _evaluate(connection: Any, expression: str) -> Any:
-    result = await _cdp_call(
-        connection,
-        "Runtime.evaluate",
-        {"expression": expression, "returnByValue": True, "awaitPromise": True},
-    )
-    remote = result.get("result", {})
-    if remote.get("subtype") == "error" or "exceptionDetails" in result:
-        raise RuntimeError("JavaScript evaluation failed")
-    return remote.get("value")
-
-
-async def _read_page_string(connection: Any, expression: str) -> str:
-    """Read a snapshot in bounded CDP messages, including large HTML/text pages."""
-    result = await _cdp_call(connection, "Runtime.evaluate", {
-        "expression": "({text: String(" + expression + ")})",
-        "returnByValue": False,
-    })
-    object_id = result.get("result", {}).get("objectId")
-    if not object_id or "exceptionDetails" in result:
-        raise RuntimeError("Could not snapshot rendered content")
-    async def call(function: str, arguments: list) -> Any:
-        answer = await _cdp_call(connection, "Runtime.callFunctionOn", {
-            "objectId": object_id, "functionDeclaration": function,
-            "arguments": [{"value": value} for value in arguments],
-            "returnByValue": True,
-        })
-        if "exceptionDetails" in answer:
-            raise RuntimeError("Could not read rendered content")
-        return answer.get("result", {}).get("value")
-    try:
-        length = await call("function(){return this.text.length}", [])
-        if not isinstance(length, int) or length > MAX_EXTRACTION_CHARS:
-            raise RuntimeError("Rendered content exceeds the 16Mi character extraction limit")
-        chunks = []
-        for start in range(0, length, 65536):
-            chunks.append(await call("function(a,b){return this.text.slice(a,b)}", [start, start + 65536]))
-        # Chunk boundaries can split a UTF-16 surrogate pair.
-        return "".join(chunks).encode("utf-16", "surrogatepass").decode("utf-16", "replace")
-    finally:
-        await _cdp_call(connection, "Runtime.releaseObject", {"objectId": object_id})
-
-
-async def _wait_ready(connection: Any) -> None:
-    deadline = time.monotonic() + 25
-    stable = 0
-    previous = -1
-    while time.monotonic() < deadline:
-        try:
-            state = await _evaluate(
-                connection,
-                "JSON.stringify({ready:document.readyState,href:location.href,n:(document.body?.innerText||'').length})",
-            )
-            parsed = json.loads(state)
-            size = int(parsed.get("n", 0))
-            stable = stable + 1 if size == previous and size > 0 else 0
-            previous = size
-            if parsed.get("ready") in {"interactive", "complete"} and stable >= 1:
-                return
-        except (RuntimeError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-        await asyncio.sleep(0.25)
-    raise TimeoutError("Google page did not finish rendering")
-
-
-async def _click_google_consent(connection: Any) -> bool:
-    clicked = await _evaluate(
-        connection,
-        """(() => {
-          const patterns=[/accept all/i,/i agree/i,/すべて同意/i];
-          for(const el of document.querySelectorAll('button,[role=button],input[type=submit]')){
-            const text=(el.innerText||el.value||el.textContent||'').trim();
-            if(patterns.some(p=>p.test(text))){el.click();return true;}
-          }
-          return false;
-        })()""",
-    )
-    return bool(clicked)
 
 
 # Windows fingerprint used only when config spoof_platform == "windows".
@@ -1558,60 +977,6 @@ async def _apply_fingerprint_override(page: Any) -> None:
         pass
 
 
-async def _type_google_query(page: Any, query: str, hl: str, gl: str) -> bool:
-    """Open Google, type the query into the search box, press Enter.
-
-    Returns False when the box or the navigation did not work out, so the caller
-    can fall back to a direct results URL instead of failing the search.
-    """
-    try:
-        await _cdp_call(
-            page, "Page.navigate", {"url": engines.google_home_url(hl, gl)}
-        )
-        await _wait_ready(page)
-        if await _click_google_consent(page):
-            await asyncio.sleep(0.8)
-            await _wait_ready(page)
-        before = str(await _evaluate(page, "location.href"))
-        focused = await _evaluate(
-            page,
-            """(() => {
-              for (const sel of ['textarea[name="q"]', 'input[name="q"]', '#APjFqb']) {
-                const el = document.querySelector(sel);
-                if (el) { el.focus(); el.click(); return true; }
-              }
-              return false;
-            })()""",
-        )
-        if not focused:
-            return False
-        await asyncio.sleep(random.uniform(0.25, 0.7))
-        # insertText produces the same input events as typing without guessing
-        # per-character key codes for non-ASCII queries.
-        await _cdp_call(page, "Input.insertText", {"text": query})
-        await asyncio.sleep(random.uniform(0.15, 0.45))
-        for event in (
-            {"type": "rawKeyDown", "key": "Enter", "code": "Enter",
-             "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
-            {"type": "char", "key": "Enter", "text": "\r"},
-            {"type": "keyUp", "key": "Enter", "code": "Enter",
-             "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
-        ):
-            await _cdp_call(page, "Input.dispatchKeyEvent", event)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            href = str(await _evaluate(page, "location.href"))
-            if href != before and "/search" in href:
-                await _wait_ready(page)
-                return True
-            await asyncio.sleep(0.25)
-        return False
-    except CaptchaRequired:
-        raise
-    except Exception:
-        return False
-
-
 async def _read_google_results(page: Any) -> list[dict]:
     """Validate the current Google page and extract result candidates."""
     final_url = str(await _evaluate(page, "location.href"))
@@ -1638,20 +1003,6 @@ async def _read_google_results(page: Any) -> list[dict]:
     if not isinstance(candidates, list):
         raise RuntimeError("Google result extraction returned an invalid payload")
     return candidates
-
-
-# Cap the rendered-HTML capture used by the non-Google engine parsers. Real
-# results pages measure 30KB-700KB; this only guards against pathological pages.
-MAX_ENGINE_HTML_CHARS = 1_800_000
-
-
-async def _read_page_html(page: Any) -> str:
-    """Return the rendered HTML of the current page, bounded in size."""
-    raw = await _read_page_string(
-        page,
-        f"document.documentElement.outerHTML.slice(0, {MAX_ENGINE_HTML_CHARS})",
-    )
-    return raw
 
 
 async def _fetch_engine_candidates(
@@ -1720,16 +1071,6 @@ async def _searxng_candidates(query: str, limit: int, hl: str) -> list[dict]:
     return engines.parse_searxng(payload, max(limit * 2, limit))
 
 
-def _env_flag(name: str, default: bool) -> bool:
-    """Read a boolean env override (1/0, true/false, yes/no, on/off)."""
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
 def _searxng_url() -> str:
     """SearXNG base URL: CW_SEARXNG_URL wins over the config file."""
     raw = os.environ.get("CW_SEARXNG_URL", "").strip()
@@ -1746,15 +1087,6 @@ def _configured_engines() -> list[str]:
 def _human_input_enabled() -> bool:
     """Whether to type the query into the Google box instead of /search?q=."""
     return _env_flag("CW_HUMAN_INPUT", bool(CONFIG["human_input"]))
-
-
-class SearchFailed(RuntimeError):
-    """Every configured engine failed; carries the per-engine attempt log."""
-
-    def __init__(self, message: str, attempts: list[dict], *, captcha: bool = False) -> None:
-        super().__init__(message)
-        self.attempts = attempts
-        self.captcha = captcha
 
 
 def _engine_skip_reason(engine: str) -> str | None:
@@ -1791,25 +1123,6 @@ def _engine_order(requested: str = "auto") -> list[str]:
         )
     # A pinned engine is tried first, then the rest as fallback.
     return [wanted] + [name for name in configured if name != wanted]
-
-
-_EXTRACT_RESULTS_JS = r"""(() => {
-  const clean = value => (value || '').replace(/\s+/g, ' ').trim();
-  const output = [];
-  for (const anchor of document.querySelectorAll('a[href]')) {
-    const heading = anchor.querySelector('h3');
-    if (!heading) continue;
-    const title = clean(heading.innerText || heading.textContent);
-    if (!title) continue;
-    const block = anchor.closest('[data-hveid]') || anchor.parentElement?.parentElement || anchor.parentElement;
-    const blockText = clean(block?.innerText || '');
-    let description = blockText;
-    if (description.startsWith(title)) description = clean(description.slice(title.length));
-    output.push({title, href: anchor.href || '', description: description.slice(0, 1000)});
-    if (output.length >= 40) break;
-  }
-  return JSON.stringify(output);
-})()"""
 
 
 async def _ensure_reused_tab(browser: Any, which: str) -> Any:
@@ -1967,28 +1280,6 @@ async def _search_google(
     return results, wait_for, _pace_warning(pace_count)
 
 
-def _normalize_candidates(engine: str, candidates: list[dict]) -> list[dict]:
-    """Decode engine redirect wrappers before the shared URL validation runs.
-
-    Google result wrappers are resolved later by ``_resolve_candidate_url`` (it
-    also follows ``/goto``-style links), but DuckDuckGo and Bing return
-    ``//duckduckgo.com/l/?uddg=`` and ``bing.com/ck/a?...u=a1`` links that must be
-    decoded first - otherwise their scheme-less / engine-host URLs are dropped as
-    unusable and every fallback search looks empty.
-    """
-    if engine == "google":
-        return candidates
-    normalized: list[dict] = []
-    for candidate in candidates:
-        href = engines.normalize_href(engine, str(candidate.get("href", "")))
-        if not href:
-            continue
-        item = dict(candidate)
-        item["href"] = href
-        normalized.append(item)
-    return normalized
-
-
 async def _search_with_fallback(
     query: str, limit: int, hl: str = "ja", gl: str = "jp", engine: str = "auto"
 ) -> dict:
@@ -2072,117 +1363,6 @@ async def _search_with_fallback(
         "attempts": attempts,
         "captcha_avoided": captcha_seen,
     }
-
-
-# Extract clean, readable text from a rendered page (no scripts/styles/nav).
-_FETCH_TEXT_JS = r"""(() => {
-  const clone = document.body ? document.body.cloneNode(true) : document;
-  for (const sel of ['script','style','noscript','svg','canvas','iframe','nav','footer','header','[aria-hidden="true"]']) {
-    clone.querySelectorAll(sel).forEach(el => el.remove());
-  }
-  const title = (document.title || '').trim();
-  const text = (clone.innerText || '').replace(/ /g, ' ');
-  return JSON.stringify({title, text});
-})()"""
-
-
-# Extract lightweight markdown (headings/paragraphs/lists) plus page links.
-_FETCH_MD_JS = r"""(() => {
-  const clean = v => (v || '').replace(/\s+/g, ' ').trim();
-  const title = (document.title || '').trim();
-  const links = [];
-  for (const a of document.querySelectorAll('a[href]')) {
-    const t = clean(a.innerText || a.textContent);
-    let h = '';
-    try { h = new URL(a.href, location.href).href; } catch (e) { continue; }
-    if (!/^https?:\/\//i.test(h)) continue;
-    if (t) links.push({text: t.slice(0, 200), url: h});
-    if (links.length >= 200) break;
-  }
-  const parts = [];
-  for (const el of document.querySelectorAll('h1,h2,h3,p,li,pre')) {
-    if (!el.isConnected) continue;
-    const t = clean(el.innerText || el.textContent);
-    if (!t) continue;
-    const tag = el.tagName;
-    if (tag === 'H1') parts.push('# ' + t);
-    else if (tag === 'H2') parts.push('## ' + t);
-    else if (tag === 'H3') parts.push('### ' + t);
-    else if (tag === 'LI') parts.push('- ' + t);
-    else if (tag === 'PRE') parts.push('```\n' + t.slice(0, 2000) + '\n```');
-    else parts.push(t);
-    if (parts.join('\n\n').length > 300000) break;
-  }
-  let markdown = parts.join('\n\n');
-  if (!markdown) markdown = clean(document.body ? document.body.innerText : '');
-  return JSON.stringify({title, markdown, links});
-})()"""
-
-
-# Page links as follow-up crawl targets (used with shaped markdown).
-_FETCH_LINKS_JS = r"""(() => {
-  const clean = v => (v || '').replace(/\s+/g, ' ').trim();
-  const out = [];
-  for (const a of document.querySelectorAll('a[href]')) {
-    const t = clean(a.innerText || a.textContent);
-    let h = '';
-    try { h = new URL(a.href, location.href).href; } catch (e) { continue; }
-    if (!/^https?:\/\//i.test(h)) continue;
-    if (t) out.push({text: t.slice(0, 200), url: h});
-    if (out.length >= 200) break;
-  }
-  return JSON.stringify(out);
-})()"""
-
-
-def _shape_markdown(html: str, url: str) -> tuple[str, str]:
-    """Shape rendered HTML into boilerplate-free markdown.
-
-    Returns (markdown, extraction): trafilatura first, html2text fallback,
-    dom-walk last resort. An empty markdown with extraction "none" means the
-    shaper saw nothing usable (caller: retry with format "text").
-    """
-    if trafilatura is not None:
-        try:
-            shaped = trafilatura.extract(
-                html,
-                output_format="markdown",
-                include_links=True,
-                include_images=False,
-                url=url,
-                deduplicate=True,
-            )
-        except Exception:
-            shaped = None
-        if shaped and len(shaped.strip()) > 200:
-            return shaped.strip(), "trafilatura"
-    if html2text is not None:
-        try:
-            conv = html2text.HTML2Text()
-            conv.body_width = 0
-            conv.ignore_images = True
-            shaped = conv.handle(html)
-        except Exception:
-            shaped = None
-        if shaped and shaped.strip():
-            return shaped.strip(), "html2text"
-    return "", "none"
-
-
-def _smart_cut(text: str, limit: int) -> tuple[str, bool]:
-    """Cut text at a sentence/word boundary; return (cut, truncated)."""
-    if len(text) <= limit:
-        return text, False
-    window = text[:limit]
-    boundary = -1
-    for match in re.finditer(r"[。.!?！？]", window):
-        boundary = match.end()
-    if boundary > limit * 0.5:
-        return window[:boundary].rstrip(), True
-    space = window.rfind(" ")
-    if space > limit * 0.5:
-        return window[:space], True
-    return window, True
 
 
 async def _fetch_page(url: str, char_limit: int, format: str = "text") -> dict:
