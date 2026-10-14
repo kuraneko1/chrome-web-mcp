@@ -282,6 +282,13 @@ class BrowserRuntime:
         # Set when the shared persistent profile was busy and this process fell
         # back to its own throwaway profile (reported by health_check).
         self.profile_fell_back = False
+        # Idle-release bookkeeping: active_calls counts browser tool calls in
+        # flight (the reaper never releases under one), last_used is the
+        # monotonic time a browser call last started (None until then), and
+        # browser_releases counts idle releases since this process started.
+        self.active_calls = 0
+        self.last_used: float | None = None
+        self.browser_releases = 0
 
     # Fingerprint hardening, injected into every new document before scripts run.
     #
@@ -1661,8 +1668,19 @@ def _health_status() -> dict:
     }
 
 
+# Tools that drive the browser; only these mark the runtime busy and refresh the
+# idle clock. health_check deliberately does not: it reports browser_idle_s,
+# which would always read ~0 if the status query itself counted as browser use
+# (and a client polling health_check would then keep Chrome alive forever).
+_BROWSER_TOOLS = ("google_search", "fetch_url")
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    tracks_browser = name in _BROWSER_TOOLS
+    if tracks_browser:
+        _RUNTIME.active_calls += 1
+        _RUNTIME.last_used = time.monotonic()
     try:
         if name == "google_search":
             query = arguments.get("query", "")
@@ -1716,6 +1734,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             payload["captcha_required"] = True
     except Exception as exc:
         payload = {"success": False, "error": str(exc)}
+    finally:
+        if tracks_browser:
+            _RUNTIME.active_calls = max(0, _RUNTIME.active_calls - 1)
     return [types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 
 
