@@ -43,6 +43,8 @@ from chrome_web_mcp import platform_runtime
 from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
 # Re-exported: callers and tests catch these as attributes of this module.
 from chrome_web_mcp.errors import CaptchaRequired, SearchFailed
+# Re-exported for tests; _stop_recorded_process (kept here) calls _process_identity.
+from chrome_web_mcp.processes import _process_identity, _terminate_owned_process
 # Re-exported for tests; the instances below stay here (patch targets).
 from chrome_web_mcp.state import SharedSearchRateLimiter, SearchEngineState, _env_flag
 # Re-exported: _resolve_candidate_url (kept here) and tests call these.
@@ -187,30 +189,6 @@ async def _build_results(
         if len(results) >= limit:
             break
     return results
-
-
-def _terminate_owned_process(proc: subprocess.Popen | None, timeout: float) -> None:
-    """Stop an owned process group without ever raising during teardown.
-
-    macOS reports EPERM from killpg while a crashed child is being reaped; a
-    cleanup path that raised there would mask the original failure.
-    """
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=timeout)
-    except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=2)
-        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
-            pass
-
-
-def _process_identity(pid: int) -> dict:
-    """Identify a same-user process without relying on a reusable PID alone."""
-    return platform_runtime.process_identity(pid)
 
 
 def _stop_recorded_process(record: dict) -> None:
