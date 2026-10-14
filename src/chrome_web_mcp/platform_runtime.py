@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -136,18 +137,46 @@ def chrome_candidates() -> list[str]:
     return []
 
 
+def _trusted_executable(path: str) -> bool:
+    """Whether a discovered Chrome candidate may be executed (F8).
+
+    A binary in a writable ``PATH`` entry, or under the checkout's git-ignored
+    ``.local-chrome``, can be planted by anyone who can write there and is
+    executed as the MCP user (first ``--version``, then as the browser). Require
+    a regular file owned by this user or root and not group/world-writable.
+    Symlinks are followed on purpose: system installs are normally a symlink
+    chain into /opt, and the real file is what gets executed.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    if info.st_uid not in (os.getuid(), 0):
+        return False
+    return not info.st_mode & 0o022
+
+
 def discover_chrome() -> str:
     configured = os.environ.get("CW_CHROME", "").strip()
     candidates = chrome_candidates()
     for candidate in candidates:
-        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
+        if not (Path(candidate).is_file() and os.access(candidate, os.X_OK)):
+            continue
+        if not _trusted_executable(candidate):
+            # A world-writable or foreign-owned candidate is a planted-binary
+            # risk (F8); keep looking for a trusted one.
+            continue
+        return candidate
     if configured:
         raise RuntimeError(f"CW_CHROME is not an executable Chrome/Chromium binary: {configured}")
     raise RuntimeError(f"No supported Chrome/Chromium executable found for {platform_key()}")
 
 
 def chrome_version(binary: str) -> str:
+    if not _trusted_executable(binary):
+        raise RuntimeError("Refusing to execute an untrusted Chrome/Chromium binary")
     try:
         completed = subprocess.run(
             [binary, "--version"],
