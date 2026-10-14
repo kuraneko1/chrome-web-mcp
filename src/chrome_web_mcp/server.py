@@ -1181,12 +1181,16 @@ async def _searxng_candidates(query: str, limit: int, hl: str) -> list[dict]:
     base = _searxng_url()
     if not base:
         raise RuntimeError("searxng engine selected but searxng_url is not configured")
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+    # A misconfigured base URL must not turn into a blind request to a private
+    # address, so it goes through the same public-URL policy as a fetch (F9).
+    base = _validate_public_url(base)
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
         response = await client.get(
             f"{base}/search",
             params={"q": query, "format": "json", "language": hl},
             headers={"Accept": "application/json"},
         )
+    _validate_public_url(str(response.url))
     if response.status_code != 200:
         raise RuntimeError(
             f"SearXNG returned HTTP {response.status_code} "

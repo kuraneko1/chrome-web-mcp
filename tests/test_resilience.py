@@ -348,3 +348,85 @@ def test_searxng_engine_is_used_when_configured(monkeypatch, engines_only, state
 
     data = run(server._search_with_fallback("query", 1))
     assert data["engine"] == "searxng"
+
+
+# --------------------------------------------------------------------------- #
+# SearXNG URL policy (F9)
+# --------------------------------------------------------------------------- #
+
+def test_searxng_refuses_a_private_base_url(monkeypatch):
+    monkeypatch.setitem(server.CONFIG, "searxng_url", "http://127.0.0.1:8080")
+    with pytest.raises(ValueError, match="Blocked"):
+        run(server._searxng_candidates("query", 5, "ja"))
+
+
+def test_searxng_validates_both_urls_and_does_not_follow_redirects(monkeypatch):
+    validated: list[str] = []
+    seen: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://searx.example/search?q=query"
+
+        def json(self):
+            return {"results": [
+                {"title": "T", "url": "https://example.com/", "content": "c"},
+            ]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kwargs):
+            seen["url"] = url
+            return FakeResponse()
+
+    def fake_validate(url):
+        validated.append(url)
+        return url
+
+    monkeypatch.setitem(server.CONFIG, "searxng_url", "https://searx.example")
+    monkeypatch.setattr(server, "_validate_public_url", fake_validate)
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    items = run(server._searxng_candidates("query", 5, "ja"))
+
+    assert seen["kwargs"]["follow_redirects"] is False
+    assert seen["url"] == "https://searx.example/search"
+    assert validated == ["https://searx.example", "https://searx.example/search?q=query"]
+    assert items == [{"title": "T", "href": "https://example.com/", "description": "c"}]
+
+
+def test_searxng_redirect_response_is_not_used(monkeypatch):
+    class FakeResponse:
+        status_code = 302
+        url = "https://searx.example/search"
+
+        def json(self):
+            return {"results": []}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setitem(server.CONFIG, "searxng_url", "https://searx.example")
+    monkeypatch.setattr(server, "_validate_public_url", lambda u: u)
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="302"):
+        run(server._searxng_candidates("query", 5, "ja"))
