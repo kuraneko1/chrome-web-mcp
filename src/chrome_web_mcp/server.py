@@ -1616,6 +1616,9 @@ def _health_status() -> dict:
     chrome_alive = _RUNTIME.chrome is not None and _RUNTIME.chrome.poll() is None
     xvfb_alive = _RUNTIME.xvfb is not None and _RUNTIME.xvfb.poll() is None
     xephyr_alive = _RUNTIME.xephyr is not None and _RUNTIME.xephyr.poll() is None
+    browser_idle_s: float | None = None
+    if chrome_alive and _RUNTIME.last_used is not None:
+        browser_idle_s = round(max(0.0, time.monotonic() - _RUNTIME.last_used), 3)
     queue_wait_s = 0.0
     try:
         connection = _SEARCH_LIMITER._connect()
@@ -1649,6 +1652,15 @@ def _health_status() -> dict:
         "chrome_alive": chrome_alive,
         "xvfb_alive": xvfb_alive,
         "xephyr_alive": xephyr_alive,
+        # Idle release: the browser is freed after idle_release_s seconds
+        # without a browser tool call (0 disables), browser_idle_s is None while
+        # no browser runs, and browser_releases counts idle releases since this
+        # process started. active_calls is 0 unless a browser call is in flight
+        # (health_check itself deliberately does not count).
+        "idle_release_s": _idle_release_s(),
+        "browser_idle_s": browser_idle_s,
+        "browser_releases": _RUNTIME.browser_releases,
+        "active_calls": _RUNTIME.active_calls,
         **_RUNTIME.gpu_info,
         "rate_limiter_queue_wait_s": round(queue_wait_s, 3),
         "rate_limit_min_delay_s": _SEARCH_LIMITER.min_delay,

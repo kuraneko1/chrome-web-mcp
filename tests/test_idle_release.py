@@ -5,6 +5,8 @@ these tests never start a browser and never sleep.
 """
 
 import asyncio
+import json
+import time
 
 import pytest
 
@@ -181,3 +183,55 @@ def test_main_schedules_and_cancels_the_reaper_only_when_enabled(monkeypatch):
     monkeypatch.setattr(server, "_idle_release_s", lambda: 0.0)
     asyncio.run(server.main())
     assert started == []  # idle_release_s=0 restores today's behaviour
+
+
+def health_data():
+    content = asyncio.run(server.call_tool("health_check", {}))
+    return json.loads(content[0].text)["data"]
+
+
+def health_runtime(monkeypatch, *, chrome=None, last_used=None, releases=0):
+    runtime = server.BrowserRuntime()
+    runtime.display_mode = "xvfb"
+    runtime.chrome = chrome
+    runtime.last_used = last_used
+    runtime.browser_releases = releases
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(server, "_LAST_CAPTCHA_TS", None)
+    monkeypatch.setattr(server, "CONFIG", dict(server._CONFIG_DEFAULTS))
+    monkeypatch.delenv("CW_IDLE_RELEASE", raising=False)
+    return runtime
+
+
+def test_health_check_reports_idle_release_fields(monkeypatch):
+    health_runtime(monkeypatch, chrome=None)
+
+    data = health_data()
+
+    assert data["idle_release_s"] == 300.0
+    assert data["browser_idle_s"] is None  # no browser running
+    assert data["browser_releases"] == 0
+    assert data["active_calls"] == 0
+
+
+def test_health_check_reports_browser_idle_and_release_count(monkeypatch):
+    health_runtime(
+        monkeypatch, chrome=FakeChrome(), last_used=time.monotonic() - 12.0, releases=3
+    )
+
+    data = health_data()
+
+    assert data["browser_releases"] == 3
+    assert data["active_calls"] == 0
+    assert data["browser_idle_s"] is not None
+    assert 11.0 <= data["browser_idle_s"] <= 13.0
+
+
+def test_health_check_reflects_idle_release_overrides(monkeypatch):
+    health_runtime(monkeypatch, chrome=None)
+    monkeypatch.setenv("CW_IDLE_RELEASE", "0")
+    assert health_data()["idle_release_s"] == 0.0
+
+    monkeypatch.setitem(server.CONFIG, "idle_release_s", 45)
+    monkeypatch.delenv("CW_IDLE_RELEASE")
+    assert health_data()["idle_release_s"] == 45.0
