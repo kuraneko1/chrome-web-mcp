@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -581,6 +583,114 @@ def test_xpra_expose_is_opt_in(monkeypatch):
     assert server._xpra_expose_enabled() is False
     monkeypatch.setenv("CW_XPRA_EXPOSE", "1")
     assert server._xpra_expose_enabled() is True
+
+
+class _FakeDisplayProcess:
+    """Stands in for Xvfb/Xephyr: already "exited" so teardown never signals a pid."""
+
+    pid = 4242
+
+    def poll(self):
+        return 0
+
+
+def _patch_x_display_seams(monkeypatch, tmp_path, real_xauth, launched):
+    """Fake the display server process but let the real xauth write the cookie."""
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(server.shutil, "which", lambda name: real_xauth if name == "xauth" else None)
+    monkeypatch.setattr(
+        server.BrowserRuntime, "_free_display_number", staticmethod(lambda: "150")
+    )
+    real_popen = server.subprocess.Popen
+
+    def fake_popen(command, **kwargs):
+        if command[0] in ("Xvfb", "Xephyr"):
+            launched.append((command, kwargs))
+            return _FakeDisplayProcess()
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    real_run = server.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] == "xdpyinfo":
+            return type("Check", (), {"returncode": 0})()
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+
+def test_xvfb_gets_a_private_cookie_file_and_chrome_uses_it(monkeypatch, tmp_path):
+    """F5: the display must require our 0600 MIT-MAGIC-COOKIE-1 file."""
+    xauth = shutil.which("xauth")
+    if not xauth:
+        pytest.skip("xauth is required for the X access-control test")
+    launched = []
+    _patch_x_display_seams(monkeypatch, tmp_path, xauth, launched)
+
+    runtime = server.BrowserRuntime()
+    display = runtime._start_xvfb()
+
+    assert display == ":150"
+    assert launched[0][0] == ["Xvfb", ":150", "-screen", "0", "1365x900x24", "-nolisten", "tcp", "-auth", runtime.xauth_file]
+    auth_path = Path(runtime.xauth_file)
+    assert auth_path.exists()
+    assert (auth_path.stat().st_mode & 0o777) == 0o600
+    listing = subprocess.run([xauth, "-f", str(auth_path), "list"], capture_output=True, text=True)
+    assert "MIT-MAGIC-COOKIE-1" in listing.stdout
+    assert runtime._browser_environment(display, runtime.xauth_file)["XAUTHORITY"] == runtime.xauth_file
+
+    runtime.cleanup()
+    assert not auth_path.exists(), "the cookie file must be removed with the display"
+
+
+def test_start_xvfb_fails_closed_without_xauth(monkeypatch, tmp_path):
+    """F5: no cookie available means no display, never an open one."""
+    launched = []
+    _patch_x_display_seams(monkeypatch, tmp_path, None, launched)
+
+    with pytest.raises(RuntimeError, match="xauth"):
+        server.BrowserRuntime()._start_xvfb()
+
+    assert launched == [], "no display server may start without an auth cookie"
+
+
+def test_private_display_socket_is_not_open_to_other_users():
+    """F5 regression guard: the real Xvfb must refuse a client without the cookie.
+
+    This runs the actual Xvfb/xauth pair when a display can be allocated, but it
+    never touches the network and is skipped when the tools are unavailable.
+    """
+    if not (shutil.which("Xvfb") and shutil.which("xdpyinfo") and shutil.which("xauth")):
+        pytest.skip("Xvfb, xdpyinfo and xauth are required")
+    runtime = server.BrowserRuntime()
+    if server.platform_runtime.platform_key() != "linux":
+        pytest.skip("private X display is Linux-only")
+    try:
+        display = runtime._start_xvfb()
+    except RuntimeError as exc:
+        pytest.skip(f"cannot allocate a private display here: {exc}")
+    try:
+        authorized = subprocess.run(
+            ["xdpyinfo", "-display", display],
+            env=runtime._browser_environment(display, runtime.xauth_file),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        anonymous_env = dict(os.environ)
+        anonymous_env.pop("XAUTHORITY", None)
+        anonymous = subprocess.run(
+            ["xdpyinfo", "-display", display],
+            env=anonymous_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        assert authorized.returncode == 0
+        assert anonymous.returncode != 0, "the private display must not accept cookie-less clients"
+    finally:
+        runtime.cleanup()
 
 
 @pytest.mark.live

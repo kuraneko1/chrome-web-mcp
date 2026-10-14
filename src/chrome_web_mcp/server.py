@@ -29,7 +29,7 @@ import fcntl
 import json
 import os
 import re
-import select
+import secrets
 import shutil
 import signal
 import subprocess
@@ -259,6 +259,10 @@ class BrowserRuntime:
         self.port: int | None = None
         self.browser_ws: str | None = None
         self.proxy: PublicNetworkProxy | None = None
+        # Per-display X auth cookie (F5): the private display is only reachable
+        # with this file, and it is removed with the display.
+        self.xauth_file: str | None = None
+        self.xauth_dir: Path | None = None
         self.xpra_server: subprocess.Popen | None = None
         self.xpra_client: subprocess.Popen | None = None
         self.user_display = os.environ.get("DISPLAY")
@@ -332,11 +336,18 @@ class BrowserRuntime:
         )
 
     @staticmethod
-    def _browser_environment(display: str) -> dict[str, str]:
-        """Force Chrome onto the private Xvfb display, never the user Wayland session."""
+    def _browser_environment(display: str, xauthority: str | None = None) -> dict[str, str]:
+        """Force Chrome onto the private Xvfb display, never the user Wayland session.
+
+        ``xauthority`` is the private display's MIT-MAGIC-COOKIE-1 file (F5);
+        without it Chrome cannot connect to a display that is no longer open to
+        every local user.
+        """
         env = os.environ.copy()
         env["DISPLAY"] = display
         env["XDG_SESSION_TYPE"] = "x11"
+        if xauthority:
+            env["XAUTHORITY"] = xauthority
         for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
             env.pop(key, None)
         return env
@@ -396,7 +407,7 @@ class BrowserRuntime:
         if not xpra:
             raise RuntimeError("Xpra is not installed; install the xpra package to solve CAPTCHA")
         self.hide_for_human()
-        server_env = self._browser_environment(self.display)
+        server_env = self._browser_environment(self.display, self.xauth_file)
         self.xpra_server = subprocess.Popen(
             [
                 xpra,
@@ -585,36 +596,11 @@ class BrowserRuntime:
         pending.replace(PROFILE_DIR / ".owned-processes.json")
 
     def _start_xvfb(self) -> str:
-        proc = subprocess.Popen(
-            ["Xvfb", "-displayfd", "1", "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            start_new_session=True,
+        return self._start_private_display(
+            "Xvfb",
+            ["-screen", "0", "1365x900x24", "-nolisten", "tcp"],
+            attr="xvfb",
         )
-        self.xvfb = proc
-        self._record_processes()
-        assert proc.stdout is not None
-        ready, _, _ = select.select([proc.stdout], [], [], 10)
-        if not ready:
-            raise RuntimeError("Xvfb did not allocate a display within 10 seconds")
-        number = proc.stdout.readline().strip()
-        if not number.isdigit():
-            raise RuntimeError("Xvfb returned an invalid display number")
-        display = f":{number}"
-        for _ in range(30):
-            check = subprocess.run(
-                ["xdpyinfo", "-display", display],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-            if check.returncode == 0:
-                return display
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        raise RuntimeError("Xvfb failed its readiness check")
 
     def _start_xephyr(self, host_display: str) -> str:
         """Start a nested Xephyr window on the user's desktop and return its display.
@@ -641,61 +627,129 @@ class BrowserRuntime:
         except OSError:
             minimizer = None
         try:
-            proc = subprocess.Popen(
-                [
-                    "Xephyr",
-                    "-displayfd",
-                    "1",
-                    "-screen",
-                    "1365x900x24",
-                    "-title",
-                    "chrome-web-mcp",
-                    "-nolisten",
-                    "tcp",
-                ],
+            display = self._start_private_display(
+                "Xephyr",
+                ["-screen", "1365x900x24", "-title", "chrome-web-mcp", "-nolisten", "tcp"],
+                attr="xephyr",
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                start_new_session=True,
+                failure_message=(
+                    "Xephyr could not allocate a nested display. "
+                    "Check DISPLAY and XAUTHORITY access to the desktop X server."
+                ),
             )
         except Exception:
             _terminate_owned_process(minimizer, 2)
             raise
-        self.xephyr = proc
-        self._record_processes()
-        assert proc.stdout is not None
-        ready, _, _ = select.select([proc.stdout], [], [], 10)
-        if not ready:
-            _terminate_owned_process(minimizer, 2)
-            raise RuntimeError("Xephyr did not allocate a display within 10 seconds")
-        number = proc.stdout.readline().strip()
-        if not number.isdigit():
-            _terminate_owned_process(minimizer, 2)
+        if minimizer is not None:
+            try:
+                minimizer.wait(timeout=10)
+            except subprocess.SubprocessError:
+                _terminate_owned_process(minimizer, 2)
+        return display
+
+    @staticmethod
+    def _xauth_binary() -> str:
+        """Return the xauth path, or fail closed (an open display is the F5 bug)."""
+        xauth = shutil.which("xauth")
+        if not xauth:
             raise RuntimeError(
-                "Xephyr could not allocate a nested display. "
-                "Check DISPLAY and XAUTHORITY access to the desktop X server."
+                "xauth is required to give the private X display an access-control "
+                "cookie; without it any local user could connect to the display and "
+                "read the browser. Install the xauth package and retry."
             )
-        display = f":{number}"
-        for _ in range(30):
-            check = subprocess.run(
-                ["xdpyinfo", "-display", display],
+        return xauth
+
+    def _create_xauth_file(self, display: str) -> str:
+        """Create a 0600 MIT-MAGIC-COOKIE-1 file for one private display (F5)."""
+        xauth = self._xauth_binary()
+        directory = Path(tempfile.mkdtemp(prefix="chrome-web-mcp-xauth-"))
+        path = directory / "Xauthority"
+        # Create the file 0600 *before* xauth writes the cookie into it.
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        cookie = secrets.token_hex(16)  # 128-bit MIT-MAGIC-COOKIE-1
+        try:
+            subprocess.run(
+                [xauth, "-f", str(path), "add", display, "MIT-MAGIC-COOKIE-1", cookie],
+                check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=10,
             )
-            if check.returncode == 0:
-                if minimizer is not None:
-                    try:
-                        minimizer.wait(timeout=10)
-                    except subprocess.SubprocessError:
-                        _terminate_owned_process(minimizer, 2)
-                return display
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        _terminate_owned_process(minimizer, 2)
-        raise RuntimeError("Xephyr failed its readiness check")
+        except (OSError, subprocess.SubprocessError) as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise RuntimeError(f"could not create the X display cookie: {exc}") from exc
+        self._discard_xauth()
+        self.xauth_dir = directory
+        self.xauth_file = str(path)
+        return self.xauth_file
+
+    def _discard_xauth(self) -> None:
+        """Remove the current display's cookie file with its private directory."""
+        if self.xauth_dir is not None:
+            shutil.rmtree(self.xauth_dir, ignore_errors=True)
+        self.xauth_dir = None
+        self.xauth_file = None
+
+    @staticmethod
+    def _free_display_number() -> str:
+        """Choose an unused X display number.
+
+        ``-displayfd`` cannot be combined with an auth cookie: the cookie must
+        exist *before* the server starts, because an empty auth file leaves the
+        display world-connectable until the first entry appears. The number is
+        therefore picked here (as ``xvfb-run`` does) and a lost race to a
+        concurrent display server is retried by the caller. Lock files always
+        live in /tmp, independent of TMPDIR.
+        """
+        for number in range(90, 200):
+            if Path(f"/tmp/.X{number}-lock").exists():
+                continue
+            if Path(f"/tmp/.X11-unix/X{number}").exists():
+                continue
+            return str(number)
+        raise RuntimeError("no free X display number between :90 and :199")
+
+    def _start_private_display(
+        self,
+        binary: str,
+        args: list[str],
+        *,
+        attr: str,
+        env: dict[str, str] | None = None,
+        attempts: int = 5,
+        failure_message: str | None = None,
+    ) -> str:
+        """Start Xvfb/Xephyr on a display we chose, with a pre-shared cookie (F5)."""
+        for _ in range(attempts):
+            display = f":{self._free_display_number()}"
+            auth = self._create_xauth_file(display)
+            proc = subprocess.Popen(
+                [binary, display, *args, "-auth", auth],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            setattr(self, attr, proc)
+            self._record_processes()
+            for _ in range(30):
+                check = subprocess.run(
+                    ["xdpyinfo", "-display", display],
+                    env=self._browser_environment(display, auth),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+                if check.returncode == 0:
+                    return display
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            _terminate_owned_process(proc, 3)
+            setattr(self, attr, None)
+            self._discard_xauth()
+        raise RuntimeError(failure_message or f"{binary} failed its readiness check")
 
     def _chrome_command(self) -> list[str]:
         if self.proxy is None:
@@ -748,7 +802,7 @@ class BrowserRuntime:
         if platform_runtime.platform_key() == "linux":
             if not display:
                 raise RuntimeError("Linux Chrome needs a private X11 display")
-            env = self._browser_environment(display)
+            env = self._browser_environment(display, self.xauth_file)
         else:
             env = os.environ.copy()
         command = self._chrome_command()
@@ -816,6 +870,8 @@ class BrowserRuntime:
         self.chrome = None
         self.xephyr = None
         self.xvfb = None
+        # The cookie file goes away with the display it authenticated (F5).
+        self._discard_xauth()
         self.display = None
         self.port = None
         self.browser_ws = None
