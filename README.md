@@ -6,31 +6,36 @@
 > Docker does not change the host OS support policy.
 
 > [!CAUTION]
-> Single-session use only: one client process, one browser, sequential searches.
+> One browser at a time per profile — one client process per profile.
 >
 > - Normal use never trips the limiter: `pace_warning` fires only at 15+
 >   searches per minute. Sequential or lightly-parallel use stays far below it.
 > - A warning is advisory, not a block: searches keep running. But Google
->   counts total volume too — sustained barrages end in CAPTCHA regardless of
->   pacing (observed after dozens of searches in one session). When challenged:
->   wait a few minutes and retry in headless (`xvfb`) mode — it usually clears
->   by itself; in visible (`xephyr`) mode, solve the challenge in the
->   `chrome-web-mcp` window yourself, then retry. `last_captcha_at` in
->   `health_check` shows the last hit.
+>   counts total volume too, so the server throttles itself: `max_searches_per_hour`
+>   (default 60) and an exponential CAPTCHA cooldown.
+> - A Google CAPTCHA no longer ends the call. Google goes on a shared cooldown
+>   and the same query is answered by the next engine in `search_engines`
+>   (DuckDuckGo, Brave, Bing, and optionally a self-hosted SearXNG by default).
+>   `data.engine` reports who answered and `data.attempts` lists every attempt.
+>   In visible (`xephyr`) mode the challenge window is left on screen so you can
+>   solve it yourself; `last_captcha_at` and `engine_cooldowns_s` in
+>   `health_check` show the current state.
 > - opencode + subagents: SAFE. All agents share one server process and one
 >   browser. Concurrent searches are pooled in a shared query queue
 >   (per-process lock + SQLite pacing) and executed sequentially — verified
 >   with 3 simultaneous subagents and 35 rapid searches, no CAPTCHA.
-> - Separate processes at once are NOT absorbed: each process spawns its OWN
->   browser, so parallel CLIs look like fresh users hitting Google together.
->   Each one can be CAPTCHA-challenged independently (observed). Stagger starts
->   by seconds or raise `CW_MIN_DELAY` / `CW_MAX_DELAY`.
+> - Separate processes at once are NOT absorbed: they share one persistent
+>   browser profile, so only one of them owns the browser at a time. A process
+>   that finds the profile busy automatically falls back to its own throwaway
+>   profile (`health_check` reports `profile_shared_fallback: true`) instead of
+>   failing. Stagger starts by seconds or raise `CW_MIN_DELAY` / `CW_MAX_DELAY`.
 
 A stdio Model Context Protocol server that exposes focused browser tools:
 
-- `google_search` — Google search through a JavaScript-rendered Chrome instance.
+- `google_search` — Google search through a JavaScript-rendered Chrome instance,
+  with automatic fallback to other engines when Google challenges.
 - `fetch_url` — JavaScript-rendered readable text extraction for public HTTP(S) URLs.
-- `health_check` — display, browser, queue, and CAPTCHA status.
+- `health_check` — display, browser, queue, CAPTCHA, profile, and engine status.
 
 The server is designed to be configured by any MCP client that can launch a
 stdio command.
@@ -47,8 +52,20 @@ stdio command.
   browser lifecycle requires it; each fetch uses its own tab.
 - Fail-closed fetching: private networks, metadata hosts, and
   credential-bearing URLs are blocked, including post-redirect targets.
-- Shared SQLite pacing for Google searches across MCP processes.
-- `health_check` for display/browser/queue/CAPTCHA observability.
+- CAPTCHA-resilient search: when Google challenges, the same query is answered
+  by the next configured engine (DuckDuckGo, Brave, Bing, or a self-hosted
+  SearXNG) and the response reports which engine answered, so one fragile
+  engine can no longer fail a tool call.
+- Warm persistent Chrome profile: cookies and consent state survive restarts, so
+  Google sees a returning browser instead of a first-time visitor. Set
+  `"profile": "ephemeral"` for the old throwaway per-process profile.
+- Consistency-first fingerprint hardening: UA, `navigator.platform`, client
+  hints, and WebGL vendor strings are kept mutually consistent (`"spoof_platform"`).
+- Shared SQLite pacing, CAPTCHA cooldowns, and an hourly search budget across
+  MCP processes.
+- Query typed into the Google search box (not a direct `/search?q=` hit) by
+  default; `"human_input": false` restores direct navigation.
+- `health_check` for display/browser/queue/CAPTCHA/profile/engine observability.
 - Linux only (Xvfb/Xephyr, `fcntl`, process groups).
 
 ## Requirements
@@ -106,7 +123,7 @@ python3 --version  # 3.10+
 python3 -m venv .venv
 . .venv/bin/activate
 python3 -m pip install -e '.'
-# or: python -m pip install chrome_web_mcp-0.2.0-py3-none-any.whl
+# or: python -m pip install chrome_web_mcp-0.3.0-py3-none-any.whl
 ```
 
 MCP handshake check (`TOOLS: ['fetch_url', 'google_search', 'health_check']` expected):
@@ -155,7 +172,7 @@ Notes:
 From a built wheel:
 
 ```bash
-python -m pip install chrome_web_mcp-0.2.0-py3-none-any.whl
+python -m pip install chrome_web_mcp-0.3.0-py3-none-any.whl
 chrome-web-mcp
 ```
 
@@ -166,7 +183,7 @@ For a published package, an MCP client can let `uvx` install it on demand:
   "mcpServers": {
     "chrome-web": {
       "command": "uvx",
-      "args": ["--from", "chrome-web-mcp==0.2.0", "chrome-web-mcp"]
+      "args": ["--from", "chrome-web-mcp==0.3.0", "chrome-web-mcp"]
     }
   }
 }
@@ -325,17 +342,33 @@ for full text. `health_check` reports server state without starting a browser.
 Input:
 
 ```json
-{"query": "search terms", "limit": 5, "hl": "ja", "gl": "jp"}
+{"query": "search terms", "limit": 5, "hl": "ja", "gl": "jp", "engine": "auto"}
 ```
 
 `limit` is an integer from 1 to 20. Results are returned as structured JSON
-with `title`, `url`, `description`, and `position` fields, plus `waited_ms`
-(the shared rate-limiter queue wait). `hl`/`gl` are optional Google language
-(`ja`/`en`) and region (`jp`/`us`) hints; defaults preserve Japanese results.
-`query` is required, max 512 chars. Searches run one at a time per process
-and are paced across processes (see Runtime configuration). Bursts of 15+
-searches per minute return a `pace_warning` — slow down or batch queries to
-avoid a Google CAPTCHA; `health_check` reports the recent count.
+with `title`, `url`, `description`, and `position` fields, plus:
+
+- `engine` — which engine answered (`google`, `ddg`, `brave`, `bing`, `searxng`).
+- `attempts` — one entry per engine tried, with `ok`, and either the error or
+  the number of results. Google challenges appear as `"error": "captcha"` with
+  the `cooldown_s` applied.
+- `captcha_avoided` — `true` when Google challenged and another engine answered.
+- `waited_ms` — the shared rate-limiter queue wait.
+- `pace_warning` — set at 15+ searches per minute.
+
+`hl`/`gl` are optional Google language (`ja`/`en`) and region (`jp`/`us`)
+hints; defaults preserve Japanese results. `engine` defaults to `auto` (the
+configured order); pinning one engine tries it first and keeps the rest as
+fallback. `query` is required, max 512 chars. Searches run one at a time per
+process and are paced across processes (see Runtime configuration).
+
+When Google challenges, the server does **not** solve the challenge: it records
+the CAPTCHA, puts Google on an exponential cooldown (shared across processes),
+and answers the query from the next engine. In visible (`xephyr`) mode the
+challenge window is left on screen so you can solve it; solving it clears the
+cooldown on the next successful Google search. Failures return
+`{"success": false, "error": "...", "attempts": [...]}`, with
+`"captcha_required": true` when a challenge was the reason.
 
 ### `fetch_url`
 
@@ -373,7 +406,16 @@ without needing the extra service.
 Input: `{}` (no arguments).
 
 Returns `display_mode`, browser/process liveness, the rate-limiter queue wait,
-its `min`/`max` delays, and the last CAPTCHA time.
+its `min`/`max` delays, `recent_searches_60s`, `pace_warning`, and
+`last_captcha_at`. It also reports the CAPTCHA-resilience state:
+
+- `profile_mode` (`persistent` or `ephemeral`), `profile_dir`, and
+  `profile_shared_fallback` (true when a sibling session owned the shared
+  profile and this process used its own throwaway one instead).
+- `engines` (the order they will be tried), `engine_cooldowns_s` (seconds of
+  remaining cooldown per engine), `searches_last_hour`,
+  `max_searches_per_hour`, `budget_exhausted`.
+- `human_input` and `spoof_platform` (the active fingerprint mode).
 
 ## Runtime configuration
 
@@ -404,6 +446,35 @@ their own values in this file. For example, use `"hl": "en"` and
 `"gl": "us"` for English/US-oriented Google results. See
 [`examples/config.md`](examples/config.md) for all settings and examples.
 
+The CAPTCHA-resilience settings are optional and default to the recommended
+values; add them only to change the behavior:
+
+```json
+{
+  "profile": "persistent",
+  "search_engines": ["google", "ddg", "brave", "bing"],
+  "searxng_url": "",
+  "human_input": true,
+  "max_searches_per_hour": 60,
+  "captcha_cooldown_s": 300,
+  "captcha_cooldown_max_s": 1800,
+  "spoof_platform": "native",
+  "disable_gpu": true
+}
+```
+
+- `profile`: `persistent` keeps a warm profile (fewer CAPTCHAs); `ephemeral`
+  restores the throwaway per-process profile.
+- `search_engines`: engines to try, in order. `searxng` requires `searxng_url`.
+- `human_input`: type the query into the Google box instead of loading
+  `/search?q=` directly.
+- `max_searches_per_hour` / `captcha_cooldown_s` / `captcha_cooldown_max_s`:
+  Google self-throttling (the cooldown doubles per consecutive CAPTCHA).
+- `spoof_platform`: `native` keeps the Linux UA and `navigator.platform`
+  consistent; `windows` applies a matching Windows UA, platform, and client
+  hints together.
+- `disable_gpu`: keep Chrome's software rendering (stable on headless hosts).
+
 The JSON file is optional. If it is absent, the built-in defaults are used and
 the browser window is shown (`show_browser: true`). Set it to `false` to hide
 the window. JSON comments are not supported, so keep `config.json` as plain
@@ -417,12 +488,23 @@ Optional environment variables:
   Settings become tool defaults when the caller omits them. Unknown keys warn
   on stderr; invalid values warn and keep the built-in default per key.
 - `CW_CHROME` — explicit Chrome/Chromium executable path.
-- `CW_PROFILE_DIR` — explicit browser profile directory. By default, each
-  server process uses an isolated per-PID temporary profile.
+- `CW_PROFILE_DIR` — explicit browser profile directory. When set it is used
+  verbatim, is never deleted, and disables the busy-profile fallback below.
+- `CW_PROFILE_MODE` — `persistent` (default) keeps one warm profile under
+  `~/.cache/chrome-web-mcp/profile` so cookies and consent state survive
+  restarts; `ephemeral` restores the throwaway per-PID profile under `/tmp`.
 - `CW_LOCK_PATH` — explicit lock-file path when `CW_PROFILE_DIR` is set.
 - `CW_RATE_LIMIT_DB` — shared SQLite path for the Google-search start-slot
-  queue. By default it is `/tmp/chrome-web-mcp/search-rate-limit.sqlite3`, so
-  separate MCP processes of the same user share one limiter.
+  queue, the CAPTCHA cooldowns, and the hourly budget. By default it is
+  `/tmp/chrome-web-mcp/search-rate-limit.sqlite3`, so separate MCP processes of
+  the same user share one limiter.
+- `CW_SEARCH_ENGINES` — comma-separated engine order, e.g. `google,ddg,brave,bing`.
+- `CW_SEARXNG_URL` — base URL of a self-hosted SearXNG; enables the `searxng`
+  engine (it is skipped while this is unset).
+- `CW_HUMAN_INPUT` — `0` disables typing into the Google search box.
+- `CW_MAX_SEARCHES_PER_HOUR` — Google-only hourly budget (`0` disables it).
+- `CW_CAPTCHA_COOLDOWN` / `CW_CAPTCHA_COOLDOWN_MAX` — first CAPTCHA cooldown in
+  seconds and the exponential cap. Defaults `300` / `1800`.
 - `CW_MIN_DELAY` / `CW_MAX_DELAY` — randomized gap (seconds) between Google
   search starts. Defaults `1.0` / `2.5`.
 - `CW_DISPLAY_MODE` — advanced environment override for `show_browser`:
@@ -441,15 +523,26 @@ Optional environment variables:
   session, so the server only reports the CAPTCHA and leaves the browser
   where it is.
 
-The default per-process profile prevents separate MCP clients from contending
-for one Chrome profile. Do not share a profile between live server processes
-unless that is intentional.
+The default profile is warm and persistent: cookies, consent state, and the
+Chrome cache survive between runs, which is what keeps Google from treating
+every session as a first-time visitor. Exactly one process owns it at a time
+(the lock file is embedded with the holder's pid/start time and is recovered
+automatically if the holder dies). A process that finds the profile held by a
+live sibling does not fail: it falls back to its own throwaway profile, the
+same isolation separate sessions had before, and reports
+`profile_shared_fallback: true` from `health_check`. To delete the warm profile,
+stop the server and remove `~/.cache/chrome-web-mcp/profile`.
+
+The engine order is `search_engines` (default `google`, `ddg`, `brave`, `bing`).
+Google is the only engine with a cooldown and an hourly budget, because it is
+the only one that challenges; the others are the reason a challenge no longer
+fails a call. `searxng` is only tried when `searxng_url` is set, and it is
+queried over its JSON API (not through the browser, whose proxy refuses private
+addresses by design).
 
 Google-search calls also reserve a slot in the shared SQLite queue. Separate
 MCP processes therefore start searches one at a time with a 1.0–2.5 second
-randomized gap. A reserved slot is not retried automatically if Google returns
-an error; the tool returns the error to the MCP client. `fetch_url` is not put
-through this Google-search queue.
+randomized gap. `fetch_url` is not put through this Google-search queue.
 
 ## Security and scope
 
