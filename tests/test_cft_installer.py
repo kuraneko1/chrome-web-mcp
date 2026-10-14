@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
 import zipfile
 from pathlib import Path
 
@@ -55,3 +57,53 @@ def test_safe_extract_rejects_path_traversal(tmp_path):
     with pytest.raises(RuntimeError, match="unsafe path"):
         installer._safe_extract(archive, destination)
     assert not (tmp_path / "escape.txt").exists()
+
+
+def _write_member(archive: Path, name: str, mode: int, payload: str = "x") -> None:
+    with zipfile.ZipFile(archive, "a") as bundle:
+        info = zipfile.ZipInfo(name)
+        info.external_attr = mode << 16
+        bundle.writestr(info, payload)
+
+
+def test_safe_extract_restores_exec_bits(tmp_path):
+    """zipfile drops Unix modes, and Chrome cannot spawn its GPU, renderer and
+    crashpad helpers without the exec bit ("GPU process isn't usable")."""
+    archive = tmp_path / "chrome.zip"
+    _write_member(archive, "chrome-mac-arm64/App/Contents/MacOS/helper", 0o100755, "binary")
+    _write_member(archive, "chrome-mac-arm64/App/Contents/Resources/data", 0o100644, "data")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    installer._safe_extract(archive, destination)
+
+    helper = destination / "chrome-mac-arm64/App/Contents/MacOS/helper"
+    data = destination / "chrome-mac-arm64/App/Contents/Resources/data"
+    assert stat.S_IMODE(helper.stat().st_mode) == 0o755
+    assert os.access(helper, os.X_OK)
+    assert stat.S_IMODE(data.stat().st_mode) == 0o644
+
+
+def test_safe_extract_recreates_framework_symlinks(tmp_path):
+    """The macOS framework reaches its Helpers through Versions/Current."""
+    archive = tmp_path / "chrome.zip"
+    _write_member(archive, "chrome-mac-arm64/App/Framework/Versions/Current", 0o120777, "155.0.8059.79")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    installer._safe_extract(archive, destination)
+
+    link = destination / "chrome-mac-arm64/App/Framework/Versions/Current"
+    assert link.is_symlink()
+    assert os.readlink(link) == "155.0.8059.79"
+
+
+def test_safe_extract_rejects_escaping_symlink(tmp_path):
+    archive = tmp_path / "chrome.zip"
+    _write_member(archive, "chrome-mac-arm64/App/escape", 0o120777, "../../../../etc/passwd")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    with pytest.raises(RuntimeError, match="unsafe symlink"):
+        installer._safe_extract(archive, destination)
+    assert not (destination / "chrome-mac-arm64/App/escape").exists()

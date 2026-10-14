@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shutil
 import stat
@@ -62,17 +63,52 @@ def _read_manifest(url: str) -> dict:
         raise RuntimeError(f"Could not read Chrome for Testing manifest: {exc}") from exc
 
 
+def _member_mode(member: zipfile.ZipInfo) -> int:
+    """Unix mode stored in a ZIP entry (0 when the writer did not set one)."""
+    return member.external_attr >> 16
+
+
 def _safe_extract(archive: Path, destination: Path) -> None:
+    """Extract a Chrome archive without escaping ``destination``.
+
+    ``zipfile`` restores neither Unix permissions nor symlinks, and Chrome's
+    macOS bundle needs both: the helper executables under
+    ``Contents/Frameworks/**/Helpers`` keep their exec bit here (without it
+    Chrome cannot spawn its GPU, renderer and crashpad children and dies with
+    "GPU process isn't usable. Goodbye"), and the framework's
+    ``Versions/Current`` entries must stay symlinks instead of becoming regular
+    files that contain a path.
+    """
     destination_resolved = destination.resolve()
     with zipfile.ZipFile(archive) as bundle:
         bad_member = bundle.testzip()
         if bad_member:
             raise RuntimeError(f"Downloaded Chrome archive failed ZIP integrity check: {bad_member}")
-        for member in bundle.infolist():
+        members = bundle.infolist()
+        links: list[tuple[Path, str]] = []
+        for member in members:
             target = (destination / member.filename).resolve()
             if not target.is_relative_to(destination_resolved):
                 raise RuntimeError("Downloaded Chrome archive contains an unsafe path")
-        bundle.extractall(destination)
+            mode = _member_mode(member)
+            if stat.S_ISLNK(mode):
+                link_target = bundle.read(member).decode("utf-8", "surrogateescape")
+                linked = (destination / member.filename).parent.joinpath(link_target).resolve()
+                if not linked.is_relative_to(destination_resolved):
+                    raise RuntimeError("Downloaded Chrome archive contains an unsafe symlink")
+                links.append((destination / member.filename, link_target))
+                continue
+            bundle.extract(member, destination)
+            if mode:
+                try:
+                    os.chmod(destination / member.filename, stat.S_IMODE(mode))
+                except OSError:
+                    pass
+        for path, link_target in links:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink() or path.exists():
+                path.unlink()
+            os.symlink(link_target, path)
 
 
 def install(project_root: Path, channel: str) -> Path:

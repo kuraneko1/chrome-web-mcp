@@ -256,16 +256,21 @@ async def _build_results(
 
 
 def _terminate_owned_process(proc: subprocess.Popen | None, timeout: float) -> None:
+    """Stop an owned process group without ever raising during teardown.
+
+    macOS reports EPERM from killpg while a crashed child is being reaped; a
+    cleanup path that raised there would mask the original failure.
+    """
     if proc is None or proc.poll() is not None:
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=timeout)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+    except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=2)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+        except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
             pass
 
 
