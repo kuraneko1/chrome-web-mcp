@@ -8,7 +8,10 @@ permissions:
   contents: read
 
 jobs:
-  linux:
+  # The Linux job must stay keyed "test": branch protection on main requires the
+  # "test (3.10)" and "test (3.13)" checks, and renaming the job silently makes
+  # those checks unreportable, which blocks every pull request from merging.
+  test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -33,7 +36,7 @@ jobs:
       - name: Build wheel and source distribution
         run: python -m build
 
-  macos:
+  test-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +61,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: python -m pytest -q -m 'not live'
 
-  docker:
+  test-docker:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
