@@ -18,6 +18,7 @@ main/run, and re-exports the names tests patch on ``chrome_web_mcp.server``):
   * results.py   - engine candidate normalization and result shaping
   * errors.py    - CaptchaRequired and SearchFailed
   * processes.py - owned-process identity and teardown
+  * registry.py  - shared-browser owner registry and attached-client heartbeats
 """
 
 from __future__ import annotations
@@ -49,6 +50,7 @@ from mcp.server.stdio import stdio_server
 from chrome_web_mcp.network import PublicNetworkProxy
 from chrome_web_mcp import engines
 from chrome_web_mcp import platform_runtime
+from chrome_web_mcp import registry
 
 # ``_CONFIG_DEFAULTS`` is re-exported for tests; ``_load_config`` builds CONFIG below.
 from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
@@ -106,8 +108,11 @@ HERE = Path(__file__).resolve().parent
 # Compatibility rules (existing installs must not break):
 #   * CW_PROFILE_DIR still wins unconditionally and is never deleted.
 #   * If another live process already holds the persistent profile lock, this
-#     process silently falls back to its own ephemeral profile - exactly what
-#     separate sessions did before, so parallel MCP clients keep working.
+#     process attaches to the browser that owner published in
+#     PROFILE_DIR/.browser.json (one Chrome for N MCP sessions instead of ~600 MB
+#     each). When that registry is missing or unusable it degrades to its own
+#     throwaway profile - exactly what separate sessions did before, so parallel
+#     MCP clients keep working.
 #   * CW_PROFILE_MODE=ephemeral (or {"profile": "ephemeral"}) restores the old
 #     throwaway behavior explicitly.
 #
@@ -118,6 +123,13 @@ DEVTOOLS_FILE: Path = Path()
 _PROFILE_EPHEMERAL = True
 _PROFILE_FELL_BACK = False
 _PROFILE_LOCK_OVERRIDDEN = False
+
+# Shared-browser attach budget. The CDP probe must be short: a stale registry
+# should cost a couple of seconds once, not delay every tool call. The lock
+# retry after a failed attach is short too, because the first _acquire_lock()
+# already waited out a dying holder's fd release.
+_ATTACH_PROBE_TIMEOUT_S = 2.0
+_ATTACH_LOCK_RETRY_S = 0.5
 
 
 def _ensure_private_dir(path: Path) -> None:
@@ -326,6 +338,17 @@ class BrowserRuntime:
         # Set when the shared persistent profile was busy and this process fell
         # back to its own throwaway profile (reported by health_check).
         self.profile_fell_back = False
+        # Shared-browser state: `shared` means this process is attached to another
+        # process's Chrome (so it owns no browser and no lock), `owner_pid` is
+        # that process's pid, and `attach_error` records why attaching failed so
+        # health_check can explain a fallback.
+        self.shared = False
+        self.owner_pid: int | None = None
+        self.attach_error: str | None = None
+        self.birth_stamp: str | None = None
+        # Set when a CDP connect to an attached browser failed: the cached
+        # endpoint must be re-probed before it is trusted again.
+        self.shared_recheck = False
         # Idle-release bookkeeping: active_calls counts browser tool calls in
         # flight (the reaper never releases under one), last_used is the
         # monotonic time a browser call last started (None until then), and
@@ -513,12 +536,12 @@ class BrowserRuntime:
     def _chrome_executable() -> str:
         return platform_runtime.discover_chrome()
 
-    def _acquire_lock(self) -> None:
+    def _acquire_lock(self, timeout: float = 4.0) -> None:
         """Acquire the profile lock, embedding our pid/starttime for forensics.
 
-        On contention we wait a few seconds (a dying holder releases its fd
-        asynchronously) and then raise an error that names the live holder, so
-        a real conflict with another running session is diagnosable at a glance
+        On contention we wait ``timeout`` seconds (a dying holder releases its fd
+        asynchronously) and then raise an error that names the live holder, so a
+        real conflict with another running session is diagnosable at a glance
         instead of a bare 'owns this profile'.
         """
         if self.lock_file is not None:
@@ -531,7 +554,7 @@ class BrowserRuntime:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 lock_file.close()
-                if time.monotonic() - start > 4.0:
+                if time.monotonic() - start > timeout:
                     raise RuntimeError(
                         "Another chrome-web MCP instance owns this profile "
                         f"({LOCK_PATH}). {self._holder_diagnosis()} A live second "
@@ -550,6 +573,8 @@ class BrowserRuntime:
             except OSError:
                 pass
             self.lock_file = lock_file
+            # Holding the election supersedes an earlier failed attach.
+            self.attach_error = None
             return
 
     @staticmethod
@@ -887,22 +912,144 @@ class BrowserRuntime:
                 time.sleep(0.1)
         raise RuntimeError("Chrome did not expose CDP within 20 seconds")
 
+    def _own_birth_stamp(self) -> str | None:
+        """This process's birth identity stamp (cached; create_time never changes)."""
+        if self.birth_stamp is None:
+            try:
+                self.birth_stamp = str(_process_identity(os.getpid())["create_time"])
+            except Exception:
+                return None
+        return self.birth_stamp
+
+    def _publish_registry(self) -> None:
+        """Publish our CDP endpoint so sibling processes can attach to this Chrome.
+
+        Only the elected owner (``lock_file`` set) publishes. Failures are not
+        fatal: without a registry a sibling simply falls back to its own
+        throwaway profile exactly as it did before sharing existed.
+        """
+        if self.lock_file is None or self.port is None or not self.browser_ws:
+            return
+        birth = self._own_birth_stamp()
+        if birth is None:
+            return
+        try:
+            registry.write_registry(
+                PROFILE_DIR,
+                pid=os.getpid(),
+                port=self.port,
+                browser_ws=self.browser_ws,
+                create_time=birth,
+            )
+        except Exception:
+            pass
+
+    def _write_client_heartbeat(self) -> None:
+        """Refresh our client heartbeat so the owner's reaper leaves Chrome up."""
+        if not self.shared:
+            return
+        birth = self._own_birth_stamp()
+        if birth is None:
+            return
+        try:
+            registry.write_heartbeat(PROFILE_DIR, pid=os.getpid(), create_time=birth)
+        except Exception:
+            # A heartbeat is an optimisation; a read-only profile directory must
+            # never fail a tool call.
+            pass
+
+    def _attach_shared(self) -> bool:
+        """Attach to the browser published by the lock holder, or record why not.
+
+        Every check is fail-closed: the registry must be a private same-user
+        file naming a loopback CDP endpoint, the recorded owner must still be
+        that exact process (pid + birth stamp), and the endpoint must answer
+        ``Browser.getVersion`` before we send any page traffic to it. On success
+        this process owns no browser and no lock, so ``cleanup()`` cannot touch
+        the owner's processes.
+        """
+        try:
+            entry = registry.load_registry(PROFILE_DIR)
+        except registry.RegistryError as exc:
+            self.attach_error = str(exc)
+            return False
+        owner_pid = entry["pid"]
+        try:
+            identity = _process_identity(owner_pid)
+        except Exception as exc:
+            self.attach_error = f"owner pid {owner_pid} is not alive ({exc})"
+            return False
+        if identity.get("create_time") != entry["create_time"]:
+            self.attach_error = f"owner pid {owner_pid} was reused by another process"
+            return False
+        if not registry.probe_browser(entry["browser_ws"], timeout=_ATTACH_PROBE_TIMEOUT_S):
+            self.attach_error = f"CDP endpoint {entry['browser_ws']} did not answer"
+            return False
+        self.port = entry["port"]
+        self.browser_ws = entry["browser_ws"]
+        self.owner_pid = owner_pid
+        self.shared = True
+        self.shared_recheck = False
+        self.attach_error = None
+        self._write_client_heartbeat()
+        return True
+
+    def _shared_still_current(self) -> bool:
+        """Cheap re-check that an already attached endpoint is still valid.
+
+        Re-reading the registry and the owner's birth identity costs one small
+        file read plus a psutil call, so every tool call can afford it; probing
+        CDP again on every call would add ~2 s.
+        """
+        try:
+            entry = registry.load_registry(PROFILE_DIR)
+        except registry.RegistryError:
+            return False
+        if entry.get("browser_ws") != self.browser_ws or entry.get("pid") != self.owner_pid:
+            return False
+        try:
+            identity = _process_identity(int(entry["pid"]))
+        except Exception:
+            return False
+        return identity.get("create_time") == entry.get("create_time")
+
     def ensure(self) -> str:
+        if self.shared and self.browser_ws:
+            if not self.shared_recheck and self._shared_still_current():
+                return self.browser_ws
+            # Either the owner exited/replaced its endpoint, or a connect to its
+            # Chrome already failed. Confirm the endpoint once more before
+            # dropping the attach, so a single hiccup does not cost a new browser.
+            if self.shared_recheck and self._shared_still_current() and registry.probe_browser(
+                self.browser_ws, timeout=_ATTACH_PROBE_TIMEOUT_S
+            ):
+                self.shared_recheck = False
+                self._write_client_heartbeat()
+                return self.browser_ws
+            self.cleanup()
         if self.chrome and self.chrome.poll() is None and self.browser_ws:
             return self.browser_ws
         self.cleanup()
         try:
             self._acquire_lock()
         except RuntimeError:
-            if not _can_fall_back_to_ephemeral():
-                raise
-            # A live sibling session owns the shared persistent profile. That is
-            # expected (one browser per profile); degrade to this process's own
-            # throwaway profile instead of failing the tool call - the same
-            # isolation separate sessions had before profiles were shared.
-            _fall_back_to_ephemeral_profile()
-            self.profile_fell_back = True
-            self._acquire_lock()
+            # A live sibling owns the profile lock. Attach to the browser it
+            # published instead of starting a second ~600 MB Chrome/Xvfb pair.
+            if self._attach_shared():
+                return self.browser_ws
+            try:
+                # The registry may have been stale because the owner died while
+                # we read it; one short retry picks the lock up if it is free.
+                self._acquire_lock(timeout=_ATTACH_LOCK_RETRY_S)
+            except RuntimeError:
+                if not _can_fall_back_to_ephemeral():
+                    raise
+                # Sharing is impossible and the profile is not ours to wait for.
+                # Degrade to this process's own throwaway profile, exactly as
+                # separate sessions did before profiles were shared.
+                _fall_back_to_ephemeral_profile()
+                self.profile_fell_back = True
+                self._acquire_lock()
         try:
             self.proxy = PublicNetworkProxy()
             if platform_runtime.platform_key() == "macos":
@@ -916,6 +1063,7 @@ class BrowserRuntime:
             else:
                 self.display = self._start_xvfb()
             self.port, self.browser_ws = self._start_chrome(self.display)
+            self._publish_registry()
             return self.browser_ws
         except Exception:
             self.cleanup()
@@ -936,6 +1084,14 @@ class BrowserRuntime:
         self.browser_ws = None
         self.search_target_id = None
         self.fetch_target_id = None
+        if self.shared:
+            # An attached client owns no browser and no lock: dropping our own
+            # heartbeat lets the owner reap at once instead of waiting for us to
+            # look idle. No other process's file, lock or profile is touched.
+            registry.remove_heartbeat(PROFILE_DIR, os.getpid())
+        self.shared = False
+        self.owner_pid = None
+        self.shared_recheck = False
         self.gpu_info = {
             "gpu_device": None,
             "gpu_renderer": None,
@@ -949,6 +1105,12 @@ class BrowserRuntime:
             try:
                 DEVTOOLS_FILE.unlink(missing_ok=True)
                 (PROFILE_DIR / ".owned-processes.json").unlink(missing_ok=True)
+                # Only the elected owner publishes a registry, so only it may
+                # remove one - and only while the file still names this process,
+                # so a newer owner's registry is never deleted. Unpublishing
+                # before releasing the lock keeps clients from attaching to a
+                # browser that is about to disappear.
+                registry.remove_registry(PROFILE_DIR, owner_pid=os.getpid())
                 if _PROFILE_EPHEMERAL:
                     # SIGTERM uses os._exit, so atexit alone cannot remove it.
                     # A persistent profile is intentionally kept between runs.
@@ -1145,13 +1307,30 @@ async def _read_google_results(page: Any) -> list[dict]:
     return candidates
 
 
+async def _connect_browser(browser_ws: str) -> Any:
+    """Open the browser-level CDP socket.
+
+    When this process is attached to a sibling's browser, a failure here is the
+    signal that the owner's Chrome stopped answering: flag the cached endpoint so
+    the next ``ensure()`` re-probes it instead of trusting it forever. A failing
+    owner-side connect (``shared`` false) needs no flag - ``ensure()`` already
+    restarts from ``chrome.poll()``.
+    """
+    try:
+        return await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    except Exception:
+        if getattr(_RUNTIME, "shared", False):
+            _RUNTIME.shared_recheck = True
+        raise
+
+
 async def _fetch_engine_candidates(
     engine: str, query: str, limit: int, hl: str, gl: str
 ) -> list[dict]:
     """Render one non-Google engine in the shared search tab and parse it."""
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
-    browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    browser = await _connect_browser(browser_ws)
     await _deny_downloads(browser)
     page: Any = None
     try:
@@ -1347,7 +1526,7 @@ async def _extract_google_candidates(
 ) -> list[dict]:
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
-    browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    browser = await _connect_browser(browser_ws)
     await _collect_gpu_info(browser)
     await _deny_downloads(browser)
     page: Any = None
@@ -1555,7 +1734,7 @@ async def _fetch_page(url: str, char_limit: int, format: str = "text") -> dict:
     validated = _validate_public_url(url)
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
-    browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    browser = await _connect_browser(browser_ws)
     await _collect_gpu_info(browser)
     await _deny_downloads(browser)
     page: Any = None
@@ -1773,8 +1952,28 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
+def _browser_role() -> tuple[str, int | None, int | None]:
+    """(role, owner_pid, attached_clients) for health_check.
+
+    ``owner`` means this process holds the profile election (whether or not its
+    Chrome is currently running); ``shared`` means it is attached to another
+    process's browser, which is the only case where ``owner_pid`` is set;
+    ``none`` means it holds neither. ``clients`` is owner-only, because only the
+    owner acts on the heartbeat files.
+    """
+    if _RUNTIME.shared:
+        return "shared", _RUNTIME.owner_pid, None
+    if _RUNTIME.lock_file is not None:
+        try:
+            return "owner", None, registry.live_client_count(PROFILE_DIR)
+        except Exception:
+            return "owner", None, 0
+    return "none", None, None
+
+
 def _health_status() -> dict:
     """Collect display/browser/queue/CAPTCHA health without starting anything."""
+    role, owner_pid, clients = _browser_role()
     chrome_alive = _RUNTIME.chrome is not None and _RUNTIME.chrome.poll() is None
     xvfb_alive = _RUNTIME.xvfb is not None and _RUNTIME.xvfb.poll() is None
     xephyr_alive = _RUNTIME.xephyr is not None and _RUNTIME.xephyr.poll() is None
@@ -1843,6 +2042,14 @@ def _health_status() -> dict:
         "profile_mode": "ephemeral" if _PROFILE_EPHEMERAL else "persistent",
         "profile_dir": str(PROFILE_DIR),
         "profile_shared_fallback": _PROFILE_FELL_BACK,
+        # Shared browser: `owner` runs the one Chrome/Xvfb pair for this profile,
+        # `shared` is attached to another process's browser, `none` has neither.
+        # `clients` counts attached processes (owner only); `shared_attach_error`
+        # explains why sharing did not happen when it did not.
+        "browser_role": role,
+        "owner_pid": owner_pid,
+        "clients": clients,
+        "shared_attach_error": _RUNTIME.attach_error,
         # Which engines this deployment can use, in the order they are tried.
         "engines": _configured_engines(),
         "engine_cooldowns_s": engine_state["cooldowns"],
@@ -1867,6 +2074,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if tracks_browser:
         _RUNTIME.active_calls += 1
         _RUNTIME.last_used = time.monotonic()
+        _heartbeat_for_attached_client()
     try:
         if name == "google_search":
             query = arguments.get("query", "")
@@ -1926,6 +2134,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 
 
+def _heartbeat_for_attached_client() -> None:
+    """Refresh an attached client's heartbeat (no-op for owners and test fakes)."""
+    note = getattr(_RUNTIME, "_write_client_heartbeat", None)
+    if callable(note):
+        note()
+
+
 def _release_if_idle(runtime: Any, now: float, idle_s: float) -> bool:
     """Release ``runtime``'s browser when it has been idle for ``idle_s``.
 
@@ -1959,9 +2174,26 @@ def _idle_reaper_interval(idle_s: float) -> float:
     return min(_IDLE_REAPER_MAX_INTERVAL_S, idle_s)
 
 
+def _attached_clients_hold_browser(idle_s: float) -> bool:
+    """True while another process has a fresh heartbeat for the shared browser.
+
+    Best effort by design: when no client ever attached there is no clients
+    directory, so this is exactly the pre-sharing single-process case; and a
+    heartbeat we cannot read must not pin Chrome forever.
+    """
+    try:
+        return registry.live_client_count(PROFILE_DIR, now=time.time(), idle_s=idle_s) > 0
+    except Exception:
+        return False
+
+
 def _reaper_tick(idle_s: float) -> bool:
     """One reaper tick: try to release the idle browser, swallowing failures."""
     try:
+        # The owner must not free the browser out from under a client that is
+        # still using it; only the owner ever sees client heartbeats.
+        if idle_s > 0 and _attached_clients_hold_browser(idle_s):
+            return False
         return _release_if_idle(_RUNTIME, time.monotonic(), idle_s)
     except Exception:
         return False

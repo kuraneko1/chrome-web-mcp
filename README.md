@@ -8,7 +8,7 @@
 > Testing, and runtime details.
 
 > [!CAUTION]
-> One browser at a time per profile — one client process per profile.
+> One browser at a time per profile — several MCP client processes share it.
 >
 > - Normal use never trips the limiter: `pace_warning` fires only at 15+
 >   searches per minute. Sequential or lightly-parallel use stays far below it.
@@ -28,11 +28,13 @@
 >   browser. Concurrent searches are pooled in a shared query queue
 >   (per-process lock + SQLite pacing) and executed sequentially — verified
 >   with 3 simultaneous subagents and 35 rapid searches, no CAPTCHA.
-> - Separate processes at once are NOT absorbed: they share one persistent
->   browser profile, so only one of them owns the browser at a time. A process
->   that finds the profile busy automatically falls back to its own throwaway
->   profile (`health_check` reports `profile_shared_fallback: true`) instead of
->   failing. Stagger starts by seconds or raise `CW_MIN_DELAY` / `CW_MAX_DELAY`.
+> - Separate processes share one browser: the first process to claim the
+>   persistent profile owns Chrome/Xvfb and publishes its CDP endpoint; later
+>   processes attach to that browser (each keeps its own tabs), so N sessions
+>   cost one ~600 MB browser tree instead of N. If the registry file is missing
+>   or unusable, a process with a busy profile still falls back to its own
+>   throwaway profile exactly as before (`profile_shared_fallback: true`).
+>   Stagger starts by seconds or raise `CW_MIN_DELAY` / `CW_MAX_DELAY`.
 
 A stdio Model Context Protocol server that exposes focused browser tools:
 
@@ -63,6 +65,13 @@ stdio command.
 - Warm persistent Chrome profile: cookies and consent state survive restarts, so
   Google sees a returning browser instead of a first-time visitor. Set
   `"profile": "ephemeral"` for the old throwaway per-process profile.
+- One shared browser per profile: the process that wins the profile lock owns
+  Chrome/Xvfb and publishes its CDP endpoint in
+  `~/.cache/chrome-web-mcp/profile/.browser.json`; every later process attaches
+  to it instead of starting another ~600 MB browser tree. Attached clients are
+  announced with `profile/clients/<pid>.json` heartbeats, and the idle reaper
+  refuses to release the browser while any client is still attached.
+  `health_check` reports `browser_role`, `owner_pid` and `clients`.
 - Consistency-first fingerprint hardening: UA, `navigator.platform`, client
   hints, and WebGL vendor strings are kept mutually consistent (`"spoof_platform"`).
 - Shared SQLite pacing, CAPTCHA cooldowns, and an hourly search budget across
@@ -479,6 +488,14 @@ the CAPTCHA-resilience state:
 - `profile_mode` (`persistent` or `ephemeral`), `profile_dir`, and
   `profile_shared_fallback` (true when a sibling session owned the shared
   profile and this process used its own throwaway one instead).
+- `browser_role` (`owner` runs the profile's one Chrome/Xvfb pair, `shared` is
+  attached to another process's browser, `none` has neither), `owner_pid` (the
+  owner's pid, set only when `shared`), and `clients` (attached client
+  processes, reported by the owner; `null` elsewhere). `shared_attach_error`
+  explains why attaching was refused when it was. Attaching validates the
+  registry file (private, same user, versioned, loopback CDP endpoint), the
+  owner's pid + birth stamp, and a `Browser.getVersion` probe, before any page
+  traffic is sent to it.
 - `engines` (the order they will be tried), `engine_cooldowns_s` (seconds of
   remaining cooldown per engine), `searches_last_hour`,
   `max_searches_per_hour`, `budget_exhausted`.
@@ -619,10 +636,26 @@ Chrome cache survive between runs, which is what keeps Google from treating
 every session as a first-time visitor. Exactly one process owns it at a time
 (the lock file is embedded with the holder's pid/start time and is recovered
 automatically if the holder dies). A process that finds the profile held by a
-live sibling does not fail: it falls back to its own throwaway profile, the
-same isolation separate sessions had before, and reports
-`profile_shared_fallback: true` from `health_check`. To delete the warm profile,
-stop the server and remove `~/.cache/chrome-web-mcp/profile`.
+live sibling attaches to the browser that owner published in
+`PROFILE_DIR/.browser.json` and skips its own Xvfb/Chrome/proxy startup, so
+several MCP sessions cost one browser tree (~600 MB) instead of one each. The
+attaching process owns no browser and no lock, so its shutdown can never kill
+or clean up the owner's Chrome. If that registry is missing, malformed, stale
+or not the owner's (pid + birth stamp + a live `Browser.getVersion` probe),
+the process keeps today's behavior: it falls back to its own throwaway profile
+and reports `profile_shared_fallback: true` from `health_check`. To delete the
+warm profile, stop the server and remove `~/.cache/chrome-web-mcp/profile`.
+
+Two limits are worth knowing. A local user on the same machine can reach the
+owner's loopback DevTools port while the browser is up, exactly as they could
+reach any of today's per-process ports; the mandatory public-network proxy still
+restricts what that browser can fetch. Moving the transport to Chrome's
+`--remote-debugging-pipe` (fds 3/4, no TCP listener) is future work; the
+owner/attach design is compatible with it because clients would talk to the
+owner over a unix socket instead of the port. Also, while a client is attached
+the owner will not idle-release the browser: the heartbeat files under
+`PROFILE_DIR/clients/` hold it up, and entries whose pid died or that go
+unrefreshed for `idle_release_s` are removed by the reaper.
 
 The engine order is `search_engines` (default `google`, `ddg`, `brave`, `bing`).
 Google is the only engine with a cooldown and an hourly budget, because it is
@@ -647,6 +680,14 @@ randomized gap. `fetch_url` is not put through this Google-search queue.
 - Downloads are denied on every browser session, and the HTTP cache is bounded,
   so a `Content-Disposition: attachment` response cannot fill the disk.
 - Each server owns and cleans up its Chrome and platform display process groups.
+  A process attached to a shared owner's browser owns neither: it starts no
+  Chrome/Xvfb and its shutdown removes only its own heartbeat file.
+- Sharing trusts `PROFILE_DIR/.browser.json` only after validating that it is a
+  private (0600), same-user regular file, that the recorded owner pid still has
+  the recorded birth identity, and that the endpoint is a loopback CDP websocket
+  that answers `Browser.getVersion`. The browser-to-network policy is unchanged:
+  every attached client's page traffic goes through the owner's mandatory
+  public-network proxy.
 - Linux Chrome is forced onto its private X11 display, which is started with a
   per-display MIT-MAGIC-COOKIE-1 file (`XAUTHORITY`); without `xauth` the server
   fails closed instead of starting a display any local user could read. macOS
@@ -659,9 +700,10 @@ randomized gap. `fetch_url` is not put through this Google-search queue.
   validated the same way.
 - Rendering as root is refused unless `CW_ALLOW_ROOT=1`, because it would
   require `--no-sandbox`.
-- The loopback DevTools port (`--remote-debugging-port=0`) is unauthenticated
-  and therefore a local-user boundary until the shared-browser work moves it to
-  `--remote-debugging-pipe`; see `docs/security-review.md` (F4).
+- Known boundary: the owner's CDP endpoint listens on `127.0.0.1`, which any
+  local user on the host can also reach while the browser runs (as with the
+  previous per-process ports). Chrome's `--remote-debugging-pipe` transport is
+  the follow-up that removes the listener; see `docs/security-review.md` (F4).
 - SIGTERM and SIGINT trigger browser and temporary-profile cleanup before exit.
   Startup recovers recorded Chrome/display processes using PID and start time,
   not broad process-name matching. Legacy profiles without process records can
