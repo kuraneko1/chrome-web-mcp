@@ -902,8 +902,16 @@ def _browser_available() -> bool:
 
 
 def _chrome_processes(profile: Path) -> list[str]:
-    """The one main Chrome process of the test profile (helpers excluded)."""
-    listing = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True, text=True).stdout
+    """The one main Chrome process of the test profile (helpers excluded).
+
+    ``-ww`` is required: without it ``ps`` truncates the command line to
+    ``COLUMNS`` (or 80 when there is no tty), which cuts off
+    ``--user-data-dir=...`` for Chrome's very long argv and made this helper
+    return nothing on CI.
+    """
+    listing = subprocess.run(
+        ["ps", "-ww", "-eo", "pid,args"], capture_output=True, text=True
+    ).stdout
     found = []
     for line in listing.splitlines():
         if (
