@@ -29,9 +29,10 @@ import fcntl
 import json
 import os
 import re
-import select
+import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ from chrome_web_mcp.config import _CONFIG_DEFAULTS, _load_config
 from chrome_web_mcp.cdp import (
     MAX_ENGINE_HTML_CHARS,
     _CDP_IDS,
+    _PAGE_CHALLENGE_PROBE_JS,
     _cdp_call,
     _click_google_consent,
     _evaluate,
@@ -87,6 +89,7 @@ from chrome_web_mcp.urlpolicy import (
     _is_google_host,
     _normalize_candidate_href,
     _validate_public_url,
+    _validate_search_query,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -117,9 +120,46 @@ _PROFILE_FELL_BACK = False
 _PROFILE_LOCK_OVERRIDDEN = False
 
 
+def _ensure_private_dir(path: Path) -> None:
+    """Create ``path`` atomically with mode 0700, or verify it is already private.
+
+    ``os.mkdir`` is atomic, so a local user cannot win a race to pre-create the
+    directory; a pre-existing directory is only accepted when it is a real
+    directory owned by this user with no group/world access. ``lstat`` is used
+    so a symlink is refused instead of followed (F7).
+    """
+    try:
+        os.mkdir(path, 0o700)
+        return
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(f"cannot create the private directory {path}: {exc}") from exc
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect the private directory {path}: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError(
+            f"refusing to use {path}: it is not a private directory owned by this "
+            f"user (mode {info.st_mode & 0o777:03o}); another local user may have "
+            "planted it"
+        )
+
+
 def _ephemeral_profile_dir() -> Path:
-    """Throwaway per-process profile (the pre-0.3.0 default)."""
-    return Path(tempfile.gettempdir()) / "chrome-web-v2-profile" / str(os.getpid())
+    """Throwaway per-process profile under a per-user private base.
+
+    The base and the per-pid leaf are created atomically with 0700, and a
+    pre-existing one that is not ours or is group/world-writable is refused: a
+    shared /tmp parent would otherwise let another local user replace the
+    profile Chrome then trusts (F7).
+    """
+    base = Path(tempfile.gettempdir()) / "chrome-web-v2-profile"
+    _ensure_private_dir(base)
+    leaf = base / str(os.getpid())
+    _ensure_private_dir(leaf)
+    return leaf
 
 
 def _persistent_profile_dir() -> Path:
@@ -257,6 +297,10 @@ class BrowserRuntime:
         self.port: int | None = None
         self.browser_ws: str | None = None
         self.proxy: PublicNetworkProxy | None = None
+        # Per-display X auth cookie (F5): the private display is only reachable
+        # with this file, and it is removed with the display.
+        self.xauth_file: str | None = None
+        self.xauth_dir: Path | None = None
         self.xpra_server: subprocess.Popen | None = None
         self.xpra_client: subprocess.Popen | None = None
         self.user_display = os.environ.get("DISPLAY")
@@ -337,11 +381,18 @@ class BrowserRuntime:
         )
 
     @staticmethod
-    def _browser_environment(display: str) -> dict[str, str]:
-        """Force Chrome onto the private Xvfb display, never the user Wayland session."""
+    def _browser_environment(display: str, xauthority: str | None = None) -> dict[str, str]:
+        """Force Chrome onto the private Xvfb display, never the user Wayland session.
+
+        ``xauthority`` is the private display's MIT-MAGIC-COOKIE-1 file (F5);
+        without it Chrome cannot connect to a display that is no longer open to
+        every local user.
+        """
         env = os.environ.copy()
         env["DISPLAY"] = display
         env["XDG_SESSION_TYPE"] = "x11"
+        if xauthority:
+            env["XAUTHORITY"] = xauthority
         for key in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
             env.pop(key, None)
         return env
@@ -401,7 +452,7 @@ class BrowserRuntime:
         if not xpra:
             raise RuntimeError("Xpra is not installed; install the xpra package to solve CAPTCHA")
         self.hide_for_human()
-        server_env = self._browser_environment(self.display)
+        server_env = self._browser_environment(self.display, self.xauth_file)
         self.xpra_server = subprocess.Popen(
             [
                 xpra,
@@ -590,36 +641,11 @@ class BrowserRuntime:
         pending.replace(PROFILE_DIR / ".owned-processes.json")
 
     def _start_xvfb(self) -> str:
-        proc = subprocess.Popen(
-            ["Xvfb", "-displayfd", "1", "-screen", "0", "1365x900x24", "-nolisten", "tcp"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            start_new_session=True,
+        return self._start_private_display(
+            "Xvfb",
+            ["-screen", "0", "1365x900x24", "-nolisten", "tcp"],
+            attr="xvfb",
         )
-        self.xvfb = proc
-        self._record_processes()
-        assert proc.stdout is not None
-        ready, _, _ = select.select([proc.stdout], [], [], 10)
-        if not ready:
-            raise RuntimeError("Xvfb did not allocate a display within 10 seconds")
-        number = proc.stdout.readline().strip()
-        if not number.isdigit():
-            raise RuntimeError("Xvfb returned an invalid display number")
-        display = f":{number}"
-        for _ in range(30):
-            check = subprocess.run(
-                ["xdpyinfo", "-display", display],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-            if check.returncode == 0:
-                return display
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        raise RuntimeError("Xvfb failed its readiness check")
 
     def _start_xephyr(self, host_display: str) -> str:
         """Start a nested Xephyr window on the user's desktop and return its display.
@@ -646,73 +672,150 @@ class BrowserRuntime:
         except OSError:
             minimizer = None
         try:
-            proc = subprocess.Popen(
-                [
-                    "Xephyr",
-                    "-displayfd",
-                    "1",
-                    "-screen",
-                    "1365x900x24",
-                    "-title",
-                    "chrome-web-mcp",
-                    "-nolisten",
-                    "tcp",
-                ],
+            display = self._start_private_display(
+                "Xephyr",
+                ["-screen", "1365x900x24", "-title", "chrome-web-mcp", "-nolisten", "tcp"],
+                attr="xephyr",
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                start_new_session=True,
+                failure_message=(
+                    "Xephyr could not allocate a nested display. "
+                    "Check DISPLAY and XAUTHORITY access to the desktop X server."
+                ),
             )
         except Exception:
             _terminate_owned_process(minimizer, 2)
             raise
-        self.xephyr = proc
-        self._record_processes()
-        assert proc.stdout is not None
-        ready, _, _ = select.select([proc.stdout], [], [], 10)
-        if not ready:
-            _terminate_owned_process(minimizer, 2)
-            raise RuntimeError("Xephyr did not allocate a display within 10 seconds")
-        number = proc.stdout.readline().strip()
-        if not number.isdigit():
-            _terminate_owned_process(minimizer, 2)
+        if minimizer is not None:
+            try:
+                minimizer.wait(timeout=10)
+            except subprocess.SubprocessError:
+                _terminate_owned_process(minimizer, 2)
+        return display
+
+    @staticmethod
+    def _xauth_binary() -> str:
+        """Return the xauth path, or fail closed (an open display is the F5 bug)."""
+        xauth = shutil.which("xauth")
+        if not xauth:
             raise RuntimeError(
-                "Xephyr could not allocate a nested display. "
-                "Check DISPLAY and XAUTHORITY access to the desktop X server."
+                "xauth is required to give the private X display an access-control "
+                "cookie; without it any local user could connect to the display and "
+                "read the browser. Install the xauth package and retry."
             )
-        display = f":{number}"
-        for _ in range(30):
-            check = subprocess.run(
-                ["xdpyinfo", "-display", display],
+        return xauth
+
+    def _create_xauth_file(self, display: str) -> str:
+        """Create a 0600 MIT-MAGIC-COOKIE-1 file for one private display (F5)."""
+        xauth = self._xauth_binary()
+        directory = Path(tempfile.mkdtemp(prefix="chrome-web-mcp-xauth-"))
+        path = directory / "Xauthority"
+        try:
+            # Create the file 0600 *before* xauth writes the cookie into it.
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            cookie = secrets.token_hex(16)  # 128-bit MIT-MAGIC-COOKIE-1
+            subprocess.run(
+                [xauth, "-f", str(path), "add", display, "MIT-MAGIC-COOKIE-1", cookie],
+                check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=10,
             )
-            if check.returncode == 0:
-                if minimizer is not None:
-                    try:
-                        minimizer.wait(timeout=10)
-                    except subprocess.SubprocessError:
-                        _terminate_owned_process(minimizer, 2)
-                return display
-            if proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        _terminate_owned_process(minimizer, 2)
-        raise RuntimeError("Xephyr failed its readiness check")
+        except (OSError, subprocess.SubprocessError) as exc:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise RuntimeError(f"could not create the X display cookie: {exc}") from exc
+        self._discard_xauth()
+        self.xauth_dir = directory
+        self.xauth_file = str(path)
+        return self.xauth_file
+
+    def _discard_xauth(self) -> None:
+        """Remove the current display's cookie file with its private directory."""
+        if self.xauth_dir is not None:
+            shutil.rmtree(self.xauth_dir, ignore_errors=True)
+        self.xauth_dir = None
+        self.xauth_file = None
+
+    @staticmethod
+    def _free_display_number() -> str:
+        """Choose an unused X display number.
+
+        ``-displayfd`` cannot be combined with an auth cookie: the cookie must
+        exist *before* the server starts, because an empty auth file leaves the
+        display world-connectable until the first entry appears. The number is
+        therefore picked here (as ``xvfb-run`` does) and a lost race to a
+        concurrent display server is retried by the caller. Lock files always
+        live in /tmp, independent of TMPDIR.
+        """
+        for number in range(90, 200):
+            if Path(f"/tmp/.X{number}-lock").exists():
+                continue
+            if Path(f"/tmp/.X11-unix/X{number}").exists():
+                continue
+            return str(number)
+        raise RuntimeError("no free X display number between :90 and :199")
+
+    def _start_private_display(
+        self,
+        binary: str,
+        args: list[str],
+        *,
+        attr: str,
+        env: dict[str, str] | None = None,
+        attempts: int = 5,
+        failure_message: str | None = None,
+    ) -> str:
+        """Start Xvfb/Xephyr on a display we chose, with a pre-shared cookie (F5)."""
+        for _ in range(attempts):
+            display = f":{self._free_display_number()}"
+            auth = self._create_xauth_file(display)
+            proc = subprocess.Popen(
+                [binary, display, *args, "-auth", auth],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            setattr(self, attr, proc)
+            self._record_processes()
+            for _ in range(30):
+                check = subprocess.run(
+                    ["xdpyinfo", "-display", display],
+                    env=self._browser_environment(display, auth),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+                if check.returncode == 0:
+                    return display
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            _terminate_owned_process(proc, 3)
+            setattr(self, attr, None)
+            self._discard_xauth()
+        raise RuntimeError(failure_message or f"{binary} failed its readiness check")
 
     def _chrome_command(self) -> list[str]:
         if self.proxy is None:
             raise RuntimeError("Public-network proxy is not ready")
         command = [
             self._chrome_executable(),
+            # F4 is deferred on purpose: this loopback listener is unauthenticated,
+            # so any local user who finds the port can drive the browser (a
+            # non-browser client sends no Origin, so Chrome's check does not
+            # apply). Moving to --remote-debugging-pipe (process-private fds, no
+            # TCP listener at all) belongs to the shared-browser work; until then
+            # this is a local-user boundary, documented in docs/security-review.md.
             "--remote-debugging-address=127.0.0.1",
             "--remote-debugging-port=0",
             f"--proxy-server={self.proxy.url}",
             "--proxy-bypass-list=<-loopback>",
             "--disable-quic",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            # Bound the HTTP cache: downloads are denied per session (F3), but a
+            # fetched page could otherwise fill the profile's disk cache.
+            "--disk-cache-size=67108864",
             f"--user-data-dir={PROFILE_DIR}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -741,6 +844,14 @@ class BrowserRuntime:
             if self.display_mode == "headless":
                 command.insert(1, "--headless=new")
         if os.geteuid() == 0:
+            # Rendering attacker-controlled HTML with the sandbox off means a
+            # renderer escape is host root (F6), so it is explicitly opt-in.
+            if not _root_allowed():
+                raise RuntimeError(
+                    "Refusing to run Chrome as root: --no-sandbox would make a "
+                    "renderer escape host root. Run as an unprivileged user (the "
+                    "Docker image uses UID 1000), or set CW_ALLOW_ROOT=1 to accept it."
+                )
             command.insert(1, "--no-sandbox")
         return command
 
@@ -750,7 +861,7 @@ class BrowserRuntime:
         if platform_runtime.platform_key() == "linux":
             if not display:
                 raise RuntimeError("Linux Chrome needs a private X11 display")
-            env = self._browser_environment(display)
+            env = self._browser_environment(display, self.xauth_file)
         else:
             env = os.environ.copy()
         command = self._chrome_command()
@@ -818,6 +929,8 @@ class BrowserRuntime:
         self.chrome = None
         self.xephyr = None
         self.xvfb = None
+        # The cookie file goes away with the display it authenticated (F5).
+        self._discard_xauth()
         self.display = None
         self.port = None
         self.browser_ws = None
@@ -984,13 +1097,33 @@ async def _apply_fingerprint_override(page: Any) -> None:
         pass
 
 
+async def _deny_downloads(browser: Any) -> None:
+    """Refuse browser-initiated downloads on the browser session (F3).
+
+    Without this, a ``Content-Disposition: attachment`` response is written to
+    the user's disk by the browser process and closing the tab does not cancel
+    the transfer. Older Chrome builds may not know the method; the bounded
+    ``--disk-cache-size`` still applies there, so a failure is not fatal.
+    """
+    try:
+        await _cdp_call(
+            browser,
+            "Browser.setDownloadBehavior",
+            {"behavior": "deny", "eventsEnabled": False},
+        )
+    except Exception:
+        pass
+
+
 async def _read_google_results(page: Any) -> list[dict]:
     """Validate the current Google page and extract result candidates."""
     final_url = str(await _evaluate(page, "location.href"))
     if not _is_google_host(urllib.parse.urlparse(final_url).hostname):
         raise RuntimeError("Google navigation left the allowed origin")
-    body_text = str(await _evaluate(page, "document.body?.innerText || ''"))
-    if _is_google_challenge(final_url, body_text):
+    # Structural challenge decision (F1): only the challenge UI's own text is
+    # considered, so a result page about CAPTCHAs is not mistaken for one.
+    challenge_text = str(await _evaluate(page, _PAGE_CHALLENGE_PROBE_JS) or "")
+    if _is_google_challenge(final_url, challenge_text):
         global _LAST_CAPTCHA_TS
         _LAST_CAPTCHA_TS = time.time()
         if _xpra_expose_enabled():
@@ -1019,6 +1152,7 @@ async def _fetch_engine_candidates(
     async with _ENSURE_LOCK:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
+    await _deny_downloads(browser)
     page: Any = None
     try:
         try:
@@ -1039,8 +1173,8 @@ async def _fetch_engine_candidates(
         url = engines.engine_url(engine, query, hl, gl, count=max(limit * 2, 10))
         await _cdp_call(page, "Page.navigate", {"url": url})
         await _wait_ready(page)
-        body_text = str(await _evaluate(page, "document.body?.innerText || ''"))
-        if engines.looks_blocked(engine, body_text):
+        challenge_text = str(await _evaluate(page, _PAGE_CHALLENGE_PROBE_JS) or "")
+        if engines.looks_blocked(engine, challenge_text):
             raise CaptchaRequired(
                 f"{engine} returned a bot challenge page instead of results."
             )
@@ -1056,15 +1190,32 @@ async def _fetch_engine_candidates(
 
 
 async def _searxng_candidates(query: str, limit: int, hl: str) -> list[dict]:
-    """Query a self-hosted SearXNG instance over its JSON API."""
+    """Query a self-hosted SearXNG instance over its JSON API.
+
+    ``searxng_url`` comes from the operator's config or environment, never from
+    model output, so a private address (localhost or a LAN host) is legitimate -
+    that is how a self-hosted instance is normally reached - and is deliberately
+    not run through the public-URL policy. Redirects are not followed, so a
+    misconfigured or hostile instance cannot bounce the client to an arbitrary
+    private target, and the engine's result URLs go through the same host policy
+    as every other search result (F9).
+    """
     base = _searxng_url()
     if not base:
         raise RuntimeError("searxng engine selected but searxng_url is not configured")
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError("searxng_url must be an absolute http(s) URL")
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
         response = await client.get(
             f"{base}/search",
             params={"q": query, "format": "json", "language": hl},
             headers={"Accept": "application/json"},
+        )
+    if response.is_redirect:
+        raise RuntimeError(
+            f"SearXNG returned a redirect (HTTP {response.status_code}); "
+            "point searxng_url at the final URL"
         )
     if response.status_code != 200:
         raise RuntimeError(
@@ -1198,6 +1349,7 @@ async def _extract_google_candidates(
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
     await _collect_gpu_info(browser)
+    await _deny_downloads(browser)
     page: Any = None
     try:
         try:
@@ -1261,6 +1413,11 @@ def _xpra_expose_enabled() -> bool:
     return os.environ.get("CW_XPRA_EXPOSE", "").strip() == "1"
 
 
+def _root_allowed() -> bool:
+    """Whether rendering as root is explicitly accepted (F6)."""
+    return _env_flag("CW_ALLOW_ROOT", False)
+
+
 def _captcha_detail_for_mode() -> str:
     if _RUNTIME.display_mode == "native":
         return (
@@ -1283,6 +1440,7 @@ async def _search_google(
     Returns (results, waited_seconds, pace_warning) so callers can expose
     queue waits and burst warnings.
     """
+    _validate_search_query(query)
     async with _SEARCH_LOCK:
         wait_for = await asyncio.to_thread(_SEARCH_LIMITER.reserve_slot)
         if wait_for:
@@ -1305,6 +1463,9 @@ async def _search_with_fallback(
     What is new is that a Google CAPTCHA no longer ends the call: Google goes on
     a shared cooldown and the next configured engine answers the same query.
     """
+    # The query reaches every configured engine (and a SearXNG host), so it is
+    # gated exactly like a fetch URL before anything is sent (F2).
+    _validate_search_query(query)
     order = _engine_order(engine)
     attempts: list[dict] = []
     captcha_seen = False
@@ -1396,6 +1557,7 @@ async def _fetch_page(url: str, char_limit: int, format: str = "text") -> dict:
         browser_ws = await asyncio.to_thread(_RUNTIME.ensure)
     browser = await websockets.connect(browser_ws, max_size=MAX_CDP_MESSAGE)
     await _collect_gpu_info(browser)
+    await _deny_downloads(browser)
     page: Any = None
     target_id: str | None = None
     try:
@@ -1646,6 +1808,9 @@ def _health_status() -> dict:
     return {
         "platform": platform_runtime.platform_description(),
         "display_mode": _RUNTIME.display_mode,
+        # Root rendering is refused unless CW_ALLOW_ROOT=1 (F6); report which
+        # case this process is in so a root-run container is diagnosable.
+        "running_as_root": os.geteuid() == 0,
         "chrome_binary": chrome_binary,
         "chrome_version": chrome_version,
         "chrome_detection_error": chrome_detection_error,

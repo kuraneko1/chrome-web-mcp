@@ -71,6 +71,8 @@ JavaScriptを実行できるChromeを使って、以下のMCPツールを提供�
   自動検出するため、通常のChromeを`/Applications`へ入れる必要はありません
 - Linuxで窓を表示する場合: `Xephyr`とデスクトップの`DISPLAY`
 - Linuxで窓を表示しない場合: `Xvfb`
+- Linuxでは`xauth`が必要です。独立displayはdisplayごとの
+  MIT-MAGIC-COOKIE-1ファイルで起動し、認証できない場合は起動せずに失敗します
 - LinuxでCAPTCHAを対話的に解除する場合（任意）: `xpra`
 - macOSではXvfb/Xephyr/DISPLAYは不要
 
@@ -117,7 +119,7 @@ Debian/Ubuntuでは、まずシステム依存パッケージをインストー�
 
 ```bash
 sudo apt update
-sudo apt install -y chromium xvfb xserver-xephyr x11-utils python3-venv
+sudo apt install -y chromium xvfb xserver-xephyr xauth x11-utils python3-venv
 ```
 
 ソースからインストールします。
@@ -207,7 +209,10 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 - `profile`: `persistent`（既定）はCookieなどを保持する永続プロファイル、
   `ephemeral`は従来の使い捨てプロファイル
 - `search_engines`: 試すエンジンの順序。`searxng`は`searxng_url`が必要
-- `searxng_url`: 自前のSearXNGのURL（例 `http://10.0.0.1:4000`、`format=json`許可が必要）
+- `searxng_url`: 自前のSearXNGのURL（`format=json`許可が必要）。設定ファイル／環境変数
+  由来の値でありモデル出力からは設定されないため、`http://10.0.0.1:4000`のような
+  プライベートアドレスも使用できます（自前インスタンスの通常の到達方法）。リダイレクトは
+  追跡しないので、最終URLを直接指定してください
 - `human_input`: `true`（既定）でGoogleの検索ボックスに入力して検索
 - `max_searches_per_hour`: Googleのみの時間あたり上限（`0`で無効）
 - `captcha_cooldown_s` / `captcha_cooldown_max_s`: CAPTCHA後のクールダウン初回値と
@@ -223,8 +228,10 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 
 環境変数で上書きする場合は `CW_PROFILE_MODE`、`CW_SEARCH_ENGINES`、
 `CW_SEARXNG_URL`、`CW_HUMAN_INPUT`、`CW_MAX_SEARCHES_PER_HOUR`、
-`CW_CAPTCHA_COOLDOWN`、`CW_CAPTCHA_COOLDOWN_MAX`、`CW_IDLE_RELEASE` を使います
-（設定ファイルより優先されます）。
+`CW_CAPTCHA_COOLDOWN`、`CW_CAPTCHA_COOLDOWN_MAX`、`CW_IDLE_RELEASE`、
+`CW_ALLOW_ROOT` を使います（設定ファイルより優先されます）。`CW_ALLOW_ROOT=1`は
+rootでの描画を明示的に許可する場合だけ設定してください（既定ではrootでの起動を
+拒否します）。
 
 日本語の検索結果にしたい場合は次を指定します。
 
@@ -250,7 +257,7 @@ JSONはコメントをサポートしていないため、説明は`config.md`�
 
 ## Docker
 
-DockerイメージにはPython依存関係、Chromium、Xvfb、Xephyrなどが含まれます。
+DockerイメージにはPython依存関係、Chromium、Xvfb、Xephyr、xauthなどが含まれます。
 
 ```bash
 docker build -t chrome-web-mcp .
@@ -396,7 +403,8 @@ CAPTCHAを記録し、Googleを指数バックオフのクールダウンに入�
 
 引数はありません。platform、表示モード、Chrome binary/version、GPU backend、
 Chrome/Xvfb/Xephyrの稼働状態、検索キューの待ち時間、直近の検索数、CAPTCHA時刻に
-加えて、CAPTCHA耐性の状態を返します。
+加えて、CAPTCHA耐性の状態を返します。`running_as_root`はrootで動作しているか
+どうかを示し、その場合は`CW_ALLOW_ROOT=1`がない限り描画を拒否します。
 
 - `profile_mode`（`persistent`または`ephemeral`）、`profile_dir`、
   `profile_shared_fallback`（他プロセスが共有プロファイルを使用中で、自分専用の
@@ -442,9 +450,21 @@ CAPTCHAを解いてから同じ検索を再試行すると、次にGoogleが成�
 
 - 任意のページコンテキストJavaScriptを実行するツールは提供しません
 - ブラウザのHTTP(S)/WebSocket接続は公開アドレスに限定します
-- URL内の認証情報や明らかな秘密情報パターンを拒否します
+- URL内の認証情報や明らかな秘密情報パターンを拒否します。`google_search`の
+  クエリも、どのエンジン（設定されたSearXNGを含む）へ送る前に同じ検査を通します
+- ブラウザのダウンロードは常に拒否し、HTTPキャッシュも上限を設けます
 - サーバーごとにChromeと必要な表示backendを所有し、終了時に回収します
-- Linuxは独立X11 display、macOSは独立temporary profileのnative/headless Chromeを使います
+- Linuxは独立X11 displayを使い、displayごとのMIT-MAGIC-COOKIE-1ファイル
+  （`XAUTHORITY`）で認証します。`xauth`がない場合は、誰でも読めるdisplayを
+  起動せずに失敗します。macOSは独立temporary profileのnative/headless Chromeを使います
+- 使い捨てプロファイルはmode 0700でアトミックに作成し、自分以外が所有する、
+  またはgroup/worldからアクセスできる既存ディレクトリは拒否します
+- 検出したChrome/Chromiumは、自分またはrootが所有し、group/worldから書き込み
+  できない通常ファイルのときだけ実行します（`CW_CHROME`も同様に検証します）
+- rootでの描画は、`--no-sandbox`が必要になるため`CW_ALLOW_ROOT=1`がない限り拒否します
+- loopbackのDevToolsポート（`--remote-debugging-port=0`）は認証がないため、
+  共有ブラウザ対応で`--remote-debugging-pipe`へ移行するまではローカルユーザーの
+  境界です。詳細は`docs/security-review.md`（F4）を参照してください
 - これは一般的なリモートブラウザ操作APIではありません
 
 ## 謝辞

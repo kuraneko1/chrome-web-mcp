@@ -60,6 +60,30 @@ def test_success_clears_the_cooldown(state):
     assert state.note_challenge("google") == 10.0  # strikes reset
 
 
+def test_hostile_strike_count_is_clamped(tmp_path):
+    """F1: a huge persisted strike count must not feed an unbounded 2**N."""
+    state = server.SearchEngineState(tmp_path / "s.sqlite3", cooldown_s=1.0, cooldown_max_s=60.0)
+    connection = state._connect()
+    try:
+        connection.execute(
+            "INSERT INTO engine_state(engine, strikes, cooldown_until, updated_at) "
+            "VALUES('google', ?, 0, 0)",
+            (10 ** 9,),
+        )
+    finally:
+        connection.close()
+
+    assert state.note_challenge("google") == 60.0
+    connection = state._connect()
+    try:
+        row = connection.execute(
+            "SELECT strikes FROM engine_state WHERE engine = 'google'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row[0] == server.SearchEngineState._MAX_STRIKES
+
+
 def test_expired_cooldown_reports_zero(state, monkeypatch):
     state.note_challenge("google")
     future = time.time() + 3600
@@ -324,3 +348,124 @@ def test_searxng_engine_is_used_when_configured(monkeypatch, engines_only, state
 
     data = run(server._search_with_fallback("query", 1))
     assert data["engine"] == "searxng"
+
+
+# --------------------------------------------------------------------------- #
+# SearXNG URL policy (F9)
+# --------------------------------------------------------------------------- #
+
+def test_searxng_allows_an_operator_configured_private_base_url(monkeypatch):
+    """A self-hosted instance is normally on localhost or a LAN host, and the
+    value is operator-controlled, so the public-URL policy must not reject it."""
+    seen: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+        url = "http://127.0.0.1:8080/search?q=query"
+
+        def json(self):
+            return {"results": [
+                {"title": "Local", "url": "https://example.com/", "content": "c"},
+            ]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kwargs):
+            seen["url"] = url
+            return FakeResponse()
+
+    def fail_validate(url):
+        raise AssertionError(f"searxng_url must not go through _validate_public_url: {url}")
+
+    monkeypatch.setitem(server.CONFIG, "searxng_url", "http://127.0.0.1:8080")
+    monkeypatch.setattr(server, "_validate_public_url", fail_validate)
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    items = run(server._searxng_candidates("query", 5, "ja"))
+
+    assert seen["kwargs"]["follow_redirects"] is False
+    assert seen["url"] == "http://127.0.0.1:8080/search"
+    assert items == [{"title": "Local", "href": "https://example.com/", "description": "c"}]
+
+
+@pytest.mark.parametrize("bad", ["file:///etc/passwd", "ftp://searx.example", "searx.example"])
+def test_searxng_rejects_a_non_http_base_url(monkeypatch, bad):
+    monkeypatch.setitem(server.CONFIG, "searxng_url", bad)
+    with pytest.raises(RuntimeError, match="http"):
+        run(server._searxng_candidates("query", 5, "ja"))
+
+
+def test_searxng_does_not_follow_redirects(monkeypatch):
+    seen: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+        url = "https://searx.example/search?q=query"
+
+        def json(self):
+            return {"results": [
+                {"title": "T", "url": "https://example.com/", "content": "c"},
+            ]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kwargs):
+            seen["url"] = url
+            return FakeResponse()
+
+    monkeypatch.setitem(server.CONFIG, "searxng_url", "https://searx.example")
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    items = run(server._searxng_candidates("query", 5, "ja"))
+
+    assert seen["kwargs"]["follow_redirects"] is False
+    assert seen["url"] == "https://searx.example/search"
+    assert items == [{"title": "T", "href": "https://example.com/", "description": "c"}]
+
+
+def test_searxng_redirect_response_is_not_used(monkeypatch):
+    class FakeResponse:
+        status_code = 302
+        is_redirect = True
+        url = "https://searx.example/search"
+
+        def json(self):
+            return {"results": []}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setitem(server.CONFIG, "searxng_url", "https://searx.example")
+    monkeypatch.setattr(server, "_validate_public_url", lambda u: u)
+    monkeypatch.setattr(server.httpx, "AsyncClient", FakeClient)
+
+    with pytest.raises(RuntimeError, match="302"):
+        run(server._searxng_candidates("query", 5, "ja"))

@@ -24,7 +24,7 @@ jobs:
       - name: Install browser dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils
+          sudo apt-get install -y xvfb xauth x11-utils
           # Ubuntu 23.10+ restricts unprivileged user namespaces through AppArmor,
           # which leaves Chrome (155+) with no usable sandbox and it aborts with
           # "FATAL:zygote_host_impl_linux.cc] No usable sandbox!". The runner
