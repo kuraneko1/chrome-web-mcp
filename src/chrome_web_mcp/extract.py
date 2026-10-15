@@ -71,18 +71,23 @@ _FETCH_MD_JS = r"""(() => {
     if (links.length >= 200) break;
   }
   const parts = [];
+  let total = 0;
   for (const el of document.querySelectorAll('h1,h2,h3,p,li,pre')) {
     if (!el.isConnected) continue;
     const t = clean(el.innerText || el.textContent);
     if (!t) continue;
     const tag = el.tagName;
-    if (tag === 'H1') parts.push('# ' + t);
-    else if (tag === 'H2') parts.push('## ' + t);
-    else if (tag === 'H3') parts.push('### ' + t);
-    else if (tag === 'LI') parts.push('- ' + t);
-    else if (tag === 'PRE') parts.push('```\n' + t.slice(0, 2000) + '\n```');
-    else parts.push(t);
-    if (parts.join('\n\n').length > 300000) break;
+    let piece = t;
+    if (tag === 'H1') piece = '# ' + t;
+    else if (tag === 'H2') piece = '## ' + t;
+    else if (tag === 'H3') piece = '### ' + t;
+    else if (tag === 'LI') piece = '- ' + t;
+    else if (tag === 'PRE') piece = '```\n' + t.slice(0, 2000) + '\n```';
+    parts.push(piece);
+    // Track the joined length as we go: re-joining the whole array on every
+    // iteration made the loop quadratic in the number of blocks (F10).
+    total += piece.length + 2;
+    if (total > 300000) break;
   }
   let markdown = parts.join('\n\n');
   if (!markdown) markdown = clean(document.body ? document.body.innerText : '');

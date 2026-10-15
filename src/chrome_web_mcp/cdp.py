@@ -185,3 +185,18 @@ async def _read_page_html(page: Any) -> str:
         f"document.documentElement.outerHTML.slice(0, {MAX_ENGINE_HTML_CHARS})",
     )
     return raw
+
+
+# Structural bot-challenge probe (F1). The decision must come from the challenge
+# UI itself, not from page text: a normal result page for the query "captcha"
+# (or one that ranks a snippet containing "not a robot") would otherwise mark
+# the engine as challenged for its whole cooldown. Returns the challenge
+# container's own text, or "" when no container is present.
+_PAGE_CHALLENGE_PROBE_JS = r"""(() => {
+  const sel = 'form[action*="/sorry"], #captcha-form, #challenge-form, '
+    + 'div.g-recaptcha, iframe[src*=recaptcha], iframe[src*=challenge], '
+    + 'form[action*="challenge"]';
+  const node = document.querySelector(sel);
+  if (!node) return '';
+  return String(node.innerText || node.textContent || node.tagName || 'challenge').slice(0, 2000);
+})()"""

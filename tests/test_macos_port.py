@@ -60,6 +60,56 @@ def test_cw_chrome_still_beats_bundled_cft(tmp_path, monkeypatch):
     assert platform_runtime.discover_chrome() == str(override)
 
 
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757])
+def test_discover_chrome_skips_a_world_or_group_writable_candidate(tmp_path, monkeypatch, mode):
+    """F8: a planted binary in a writable PATH/.local-chrome must not run."""
+    planted = tmp_path / "planted-chrome"
+    planted.write_text("#!/bin/sh\n", encoding="utf-8")
+    planted.chmod(mode)
+    trusted = tmp_path / "trusted-chrome"
+    trusted.write_text("#!/bin/sh\n", encoding="utf-8")
+    trusted.chmod(0o755)
+    monkeypatch.setattr(
+        platform_runtime, "chrome_candidates", lambda: [str(planted), str(trusted)]
+    )
+
+    assert platform_runtime.discover_chrome() == str(trusted)
+
+
+def test_cw_chrome_is_validated_like_any_candidate(tmp_path, monkeypatch):
+    """F8: the CW_CHROME override keeps working, but must be trusted too."""
+    planted = tmp_path / "planted-chrome"
+    planted.write_text("#!/bin/sh\n", encoding="utf-8")
+    planted.chmod(0o777)
+    monkeypatch.setenv("CW_CHROME", str(planted))
+    monkeypatch.setattr(platform_runtime, "platform_key", lambda: "linux")
+
+    with pytest.raises(RuntimeError, match="CW_CHROME"):
+        platform_runtime.discover_chrome()
+
+
+def test_chrome_version_refuses_an_untrusted_binary(tmp_path):
+    """F8: health_check must not execute a planted binary either."""
+    planted = tmp_path / "planted-chrome"
+    planted.write_text("#!/bin/sh\necho planted\n", encoding="utf-8")
+    planted.chmod(0o777)
+
+    with pytest.raises(RuntimeError, match="untrusted"):
+        platform_runtime.chrome_version(str(planted))
+
+
+def test_discover_chrome_follows_system_symlinks(tmp_path, monkeypatch):
+    """F8: /usr/bin/google-chrome is normally a symlink; the target is checked."""
+    target = tmp_path / "real-chrome"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    target.chmod(0o755)
+    link = tmp_path / "chrome-link"
+    link.symlink_to(target)
+    monkeypatch.setattr(platform_runtime, "chrome_candidates", lambda: [str(link)])
+
+    assert platform_runtime.discover_chrome() == str(link)
+
+
 def test_mac_visible_backend(monkeypatch):
     monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "macos")
     monkeypatch.delenv("CW_DISPLAY_MODE", raising=False)

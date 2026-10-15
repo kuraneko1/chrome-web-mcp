@@ -24,7 +24,15 @@ jobs:
       - name: Install browser dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils
+          sudo apt-get install -y xvfb xauth x11-utils
+          # Ubuntu 23.10+ restricts unprivileged user namespaces through AppArmor,
+          # which leaves Chrome (155+) with no usable sandbox and it aborts with
+          # "FATAL:zygote_host_impl_linux.cc] No usable sandbox!". The runner
+          # allows relaxing the restriction, which keeps Chrome's real sandbox
+          # enabled for the browser tests instead of falling back to --no-sandbox.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
           google-chrome --version
       - name: Install package and test dependencies
         run: python -m pip install -e '.[test]' build

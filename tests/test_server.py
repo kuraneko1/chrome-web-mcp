@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +31,12 @@ _call_tool: Any = server.call_tool
 def run_async(awaitable):
     """Run an async call in a sync test."""
     return asyncio.run(awaitable)
+
+
+class _FakeProxy:
+    """Stands in for PublicNetworkProxy when only its URL is needed."""
+
+    url = "http://127.0.0.1:12345"
 
 
 def test_exposes_google_search_and_fetch_url_tool_names():
@@ -68,6 +76,102 @@ def test_google_challenge_is_detected_from_url_or_rendered_text():
     assert server._is_google_challenge("https://www.google.com/sorry/index", "")
     assert server._is_google_challenge("https://www.google.com/search?q=x", "Our systems have detected unusual traffic")
     assert not server._is_google_challenge("https://www.google.com/search?q=x", "Normal search results")
+
+
+def test_google_results_ask_the_structural_probe_instead_of_the_body(monkeypatch):
+    """F1: challenge detection must not scan ordinary result text."""
+    expressions = []
+
+    async def fake_evaluate(conn, expr):
+        expressions.append(expr)
+        if expr == "location.href":
+            return "https://www.google.com/search?q=captcha"
+        return ""
+
+    async def fake_read(conn, expr):
+        return "[]"
+
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(server, "_read_page_string", fake_read)
+
+    assert run_async(server._read_google_results(object())) == []
+    assert server._PAGE_CHALLENGE_PROBE_JS in expressions
+    assert "document.body?.innerText || ''" not in expressions
+
+
+def test_structural_probe_hit_raises_captcha_required(monkeypatch):
+    async def fake_evaluate(conn, expr):
+        if expr == "location.href":
+            return "https://www.google.com/search?q=x"
+        return "Our systems have detected unusual traffic from your computer network"
+
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+
+    with pytest.raises(server.CaptchaRequired):
+        run_async(server._read_google_results(object()))
+
+
+def test_engine_challenge_check_uses_the_structural_probe(monkeypatch):
+    """F1: fallback engines must not classify their rendered body text either."""
+    expressions = []
+    blocked_args = []
+
+    class FakeConn:
+        async def send(self, msg):
+            pass
+
+        async def recv(self):
+            return '{"id": 1, "result": {}}'
+
+        async def close(self):
+            pass
+
+    async def fake_connect(*args, **kwargs):
+        return FakeConn()
+
+    async def fake_cdp(conn, method, params=None):
+        return {}
+
+    async def fake_evaluate(conn, expr):
+        expressions.append(expr)
+        return "" if expr == server._PAGE_CHALLENGE_PROBE_JS else "not a robot"
+
+    async def fake_search_page(browser):
+        return FakeConn(), "tab", False
+
+    async def fake_wait(conn):
+        return None
+
+    async def fake_to_thread(fn, *a, **k):
+        result = fn(*a, **k)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    runtime = server.BrowserRuntime()
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(runtime, "ensure", lambda: "ws://127.0.0.1:1/devtools/browser/x")
+    monkeypatch.setattr(server.websockets, "connect", fake_connect)
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(server, "_wait_ready", fake_wait)
+    monkeypatch.setattr(server, "_ensure_search_page", fake_search_page)
+    monkeypatch.setattr(server, "_read_page_html", lambda page: _async_value("<html></html>"))
+    monkeypatch.setattr(server.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        server.engines, "looks_blocked",
+        lambda engine, challenge_text: blocked_args.append(challenge_text) or False,
+    )
+    monkeypatch.setattr(server.engines, "parse_results", lambda engine, html, limit: [])
+
+    assert run_async(server._fetch_engine_candidates("ddg", "q", 5, "ja", "jp")) == []
+    assert server._PAGE_CHALLENGE_PROBE_JS in expressions
+    assert "document.body?.innerText || ''" not in expressions
+    assert blocked_args == [""]
+
+
+async def _async_value(value):
+    return value
 
 
 def test_human_display_environment_uses_real_x11_display(monkeypatch):
@@ -205,6 +309,81 @@ def test_rejects_non_public_or_secret_result_urls(url):
         server._validate_public_url(url)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "AKIAIOSFODNN7EXAMPLE",
+        "ASIAIOSFODNN7EXAMPLE",
+        "gho_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ghs_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ghu_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ghr_0123456789abcdefghijklmnopqrstuvwxyz",
+        "ya29.a0AfH6SMBx-0123456789abcdef",
+        "sk_live_0123456789abcdefghij",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g",
+    ],
+)
+def test_secret_gate_covers_new_credential_shapes(value):
+    """F2: the extended pattern must block these in URLs and in search queries."""
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_public_url(f"https://example.com/?x={value}")
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_search_query(f"look this up: {value}")
+
+
+def test_secret_gate_checks_percent_decoded_values():
+    encoded = "https://example.com/?token=sk-abcdefghijklmnopqrstuvwxyz"
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_public_url(encoded.replace("sk-", "sk%2D"))
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_search_query("query%3Dsk-abcdefghijklmnopqrstuvwxyz")
+
+
+def test_secret_gate_uses_own_environment_values_as_needles(monkeypatch):
+    """F2: a private token with no vendor prefix is caught via the process env."""
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "private-value-0123456789")
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_search_query("search for private-value-0123456789")
+    with pytest.raises(ValueError, match="Blocked"):
+        server._validate_public_url("https://example.com/?q=private-value-0123456789")
+
+    # A short value, or one whose variable name is not credential-like, is not a needle.
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "short")
+    monkeypatch.setenv("INTERNAL_SERVICE_LABEL", "private-value-0123456789")
+    server._validate_search_query("search for private-value-0123456789")
+
+
+def test_secret_gate_never_echoes_the_offending_value(monkeypatch):
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    with pytest.raises(ValueError) as exc:
+        server._validate_public_url(f"https://example.com/?k={secret}")
+    assert secret not in str(exc.value)
+    with pytest.raises(ValueError) as exc:
+        server._validate_search_query(secret)
+    assert secret not in str(exc.value)
+
+
+def test_google_search_tool_blocks_queries_that_carry_secrets(monkeypatch, tmp_path):
+    """F2: the gate runs before any engine is asked, so nothing leaves the process."""
+    called = []
+
+    async def fake_google(query, limit, hl="ja", gl="jp"):
+        called.append(query)
+        return []
+
+    monkeypatch.setattr(server, "_extract_google_candidates", fake_google)
+    monkeypatch.setattr(server, "_ENGINE_STATE", server.SearchEngineState(tmp_path / "state.sqlite3"))
+    monkeypatch.setitem(server.CONFIG, "search_engines", ["google"])
+    payload = json.loads(
+        run_async(_call_tool("google_search", {"query": "AKIAIOSFODNN7EXAMPLE"}))[0].text
+    )
+    assert payload["success"] is False
+    assert "credential" in payload["error"]
+    assert "AKIA" not in payload["error"]
+    assert called == []
+
+
 def test_call_tool_returns_single_structured_json_layer(monkeypatch, tmp_path):
     async def fake_google(query, limit, hl="ja", gl="jp"):
         assert query == "Hermes Agent"
@@ -246,6 +425,134 @@ def test_build_results_deduplicates_and_honors_limit():
         {"title": "One", "url": "https://one.example/a", "description": "first", "position": 1},
         {"title": "Two", "url": "https://two.example/b", "description": "second", "position": 2},
     ]
+
+
+def test_download_policy_is_denied_on_the_browser_session(monkeypatch):
+    """F3: every browser-level CDP session must refuse downloads."""
+    calls = []
+
+    async def fake_cdp(conn, method, params=None):
+        calls.append((method, params))
+        return {}
+
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+
+    run_async(server._deny_downloads(object()))
+
+    assert calls == [
+        ("Browser.setDownloadBehavior", {"behavior": "deny", "eventsEnabled": False})
+    ]
+
+
+def test_unsupported_download_policy_is_not_fatal(monkeypatch):
+    """An older Chrome that lacks the method must not break fetch_url."""
+    async def fake_cdp(conn, method, params=None):
+        raise RuntimeError("CDP failed: 'Browser.setDownloadBehavior' wasn't found")
+
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+
+    run_async(server._deny_downloads(object()))
+
+
+def test_fetch_page_sets_the_download_policy_before_navigating(monkeypatch):
+    methods = []
+
+    async def fake_ensure():
+        return "ws://127.0.0.1:1/devtools/browser/x"
+
+    class FakeConn:
+        async def send(self, msg):
+            pass
+
+        async def recv(self):
+            return '{"id": 1, "result": {}}'
+
+        async def close(self):
+            pass
+
+    async def fake_connect(*args, **kwargs):
+        return FakeConn()
+
+    async def fake_cdp(conn, method, params=None):
+        methods.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "fetch-tab"}
+        return {}
+
+    async def fake_evaluate(conn, expr):
+        if "location.href" in expr:
+            return "https://example.com/"
+        if "clone" in expr:
+            return '{"title": "t", "text": "hello"}'
+        return "[]"
+
+    async def fake_wait(conn):
+        return None
+
+    async def fake_to_thread(fn, *a, **k):
+        result = fn(*a, **k)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    runtime = server.BrowserRuntime()
+    runtime.port = 1
+    monkeypatch.setattr(server, "_RUNTIME", runtime)
+    monkeypatch.setattr(server, "_cdp_call", fake_cdp)
+    monkeypatch.setattr(server, "_evaluate", fake_evaluate)
+    monkeypatch.setattr(server, "_read_page_string", fake_evaluate)
+    monkeypatch.setattr(server, "_wait_ready", fake_wait)
+    monkeypatch.setattr(server, "_validate_public_url", lambda u: u)
+    monkeypatch.setattr(server.websockets, "connect", fake_connect)
+    monkeypatch.setattr(server.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(runtime, "ensure", fake_ensure)
+
+    result = run_async(server._fetch_page("https://example.com/", 500))
+
+    assert result["text"] == "hello"
+    assert methods.index("Browser.setDownloadBehavior") < methods.index("Target.createTarget")
+
+
+def test_chrome_command_bounds_the_disk_cache(monkeypatch):
+    """F3: an unbounded cache is the other half of the download problem."""
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
+    monkeypatch.setattr(server.BrowserRuntime, "_chrome_executable", staticmethod(lambda: "/bin/echo"))
+    runtime = server.BrowserRuntime()
+    runtime.proxy = _FakeProxy()
+
+    assert "--disk-cache-size=67108864" in runtime._chrome_command()
+
+
+def _root_runtime(monkeypatch):
+    monkeypatch.setattr(server.platform_runtime, "platform_key", lambda: "linux")
+    monkeypatch.setattr(server.BrowserRuntime, "_chrome_executable", staticmethod(lambda: "/bin/echo"))
+    monkeypatch.setattr(server.os, "geteuid", lambda: 0)
+    runtime = server.BrowserRuntime()
+    runtime.proxy = _FakeProxy()
+    return runtime
+
+
+def test_refuses_to_render_as_root_without_the_opt_in(monkeypatch):
+    """F6: --no-sandbox as root would make a renderer escape host root."""
+    monkeypatch.delenv("CW_ALLOW_ROOT", raising=False)
+
+    with pytest.raises(RuntimeError, match="CW_ALLOW_ROOT"):
+        _root_runtime(monkeypatch)._chrome_command()
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+def test_root_opt_in_restores_no_sandbox(monkeypatch, value):
+    monkeypatch.setenv("CW_ALLOW_ROOT", value)
+
+    assert "--no-sandbox" in _root_runtime(monkeypatch)._chrome_command()
+
+
+def test_health_check_reports_running_as_root(monkeypatch):
+    monkeypatch.setattr(server.os, "geteuid", lambda: 0)
+
+    payload = json.loads(run_async(_call_tool("health_check", {}))[0].text)
+
+    assert payload["data"]["running_as_root"] is True
 
 
 def test_fetch_page_runs_concurrent_calls_on_separate_tabs(monkeypatch):
@@ -375,6 +682,114 @@ def test_xpra_expose_is_opt_in(monkeypatch):
     assert server._xpra_expose_enabled() is True
 
 
+class _FakeDisplayProcess:
+    """Stands in for Xvfb/Xephyr: already "exited" so teardown never signals a pid."""
+
+    pid = 4242
+
+    def poll(self):
+        return 0
+
+
+def _patch_x_display_seams(monkeypatch, tmp_path, real_xauth, launched):
+    """Fake the display server process but let the real xauth write the cookie."""
+    monkeypatch.setattr(server.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(server.shutil, "which", lambda name: real_xauth if name == "xauth" else None)
+    monkeypatch.setattr(
+        server.BrowserRuntime, "_free_display_number", staticmethod(lambda: "150")
+    )
+    real_popen = server.subprocess.Popen
+
+    def fake_popen(command, **kwargs):
+        if command[0] in ("Xvfb", "Xephyr"):
+            launched.append((command, kwargs))
+            return _FakeDisplayProcess()
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    real_run = server.subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] == "xdpyinfo":
+            return type("Check", (), {"returncode": 0})()
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+
+def test_xvfb_gets_a_private_cookie_file_and_chrome_uses_it(monkeypatch, tmp_path):
+    """F5: the display must require our 0600 MIT-MAGIC-COOKIE-1 file."""
+    xauth = shutil.which("xauth")
+    if not xauth:
+        pytest.skip("xauth is required for the X access-control test")
+    launched = []
+    _patch_x_display_seams(monkeypatch, tmp_path, xauth, launched)
+
+    runtime = server.BrowserRuntime()
+    display = runtime._start_xvfb()
+
+    assert display == ":150"
+    assert launched[0][0] == ["Xvfb", ":150", "-screen", "0", "1365x900x24", "-nolisten", "tcp", "-auth", runtime.xauth_file]
+    auth_path = Path(runtime.xauth_file)
+    assert auth_path.exists()
+    assert (auth_path.stat().st_mode & 0o777) == 0o600
+    listing = subprocess.run([xauth, "-f", str(auth_path), "list"], capture_output=True, text=True)
+    assert "MIT-MAGIC-COOKIE-1" in listing.stdout
+    assert runtime._browser_environment(display, runtime.xauth_file)["XAUTHORITY"] == runtime.xauth_file
+
+    runtime.cleanup()
+    assert not auth_path.exists(), "the cookie file must be removed with the display"
+
+
+def test_start_xvfb_fails_closed_without_xauth(monkeypatch, tmp_path):
+    """F5: no cookie available means no display, never an open one."""
+    launched = []
+    _patch_x_display_seams(monkeypatch, tmp_path, None, launched)
+
+    with pytest.raises(RuntimeError, match="xauth"):
+        server.BrowserRuntime()._start_xvfb()
+
+    assert launched == [], "no display server may start without an auth cookie"
+
+
+def test_private_display_socket_is_not_open_to_other_users():
+    """F5 regression guard: the real Xvfb must refuse a client without the cookie.
+
+    This runs the actual Xvfb/xauth pair when a display can be allocated, but it
+    never touches the network and is skipped when the tools are unavailable.
+    """
+    if not (shutil.which("Xvfb") and shutil.which("xdpyinfo") and shutil.which("xauth")):
+        pytest.skip("Xvfb, xdpyinfo and xauth are required")
+    runtime = server.BrowserRuntime()
+    if server.platform_runtime.platform_key() != "linux":
+        pytest.skip("private X display is Linux-only")
+    try:
+        display = runtime._start_xvfb()
+    except RuntimeError as exc:
+        pytest.skip(f"cannot allocate a private display here: {exc}")
+    try:
+        authorized = subprocess.run(
+            ["xdpyinfo", "-display", display],
+            env=runtime._browser_environment(display, runtime.xauth_file),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        anonymous_env = dict(os.environ)
+        anonymous_env.pop("XAUTHORITY", None)
+        anonymous = subprocess.run(
+            ["xdpyinfo", "-display", display],
+            env=anonymous_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        assert authorized.returncode == 0
+        assert anonymous.returncode != 0, "the private display must not accept cookie-less clients"
+    finally:
+        runtime.cleanup()
+
+
 @pytest.mark.live
 def test_live_google_search_returns_real_external_results():
     try:
@@ -395,6 +810,16 @@ def test_live_google_search_returns_real_external_results():
 def test_smart_cut_keeps_short_text():
     cut, truncated = server._smart_cut("hello", 100)
     assert (cut, truncated) == ("hello", False)
+
+
+def test_markdown_fallback_accumulates_length_linearly():
+    """F10: the DOM-walk fallback must not re-join the parts every iteration."""
+    script = server._FETCH_MD_JS
+    loop = script[script.index("for (const el of"):script.index("let markdown = parts.join")]
+
+    assert "parts.join" not in loop
+    assert "total +=" in loop
+    assert "if (total > 300000) break;" in loop
 
 
 def test_smart_cut_prefers_sentence_boundary():
