@@ -10,8 +10,8 @@ Two families are supported:
 * ``browser`` engines are rendered in the shared Chrome tab and parsed from the
   rendered HTML (so JavaScript-only result layouts still work).
 * ``http`` engines are called directly with httpx - used for a self-hosted
-  SearXNG instance. Its base URL must pass the same public-URL policy as a
-  fetch target, so a private address is refused instead of queried blindly.
+  SearXNG instance, and for SerpBase, a hosted search API that is enabled by
+  setting an API key. Neither needs the browser, so neither can hit a CAPTCHA.
 
 Parsing lives here in Python rather than in per-engine page JavaScript so every
 selector can be unit-tested offline against saved fixtures (``tests/fixtures``).
@@ -29,7 +29,8 @@ import lxml.html
 # Order matters: the first engine that returns usable results wins.
 DEFAULT_ENGINE_ORDER = ("google", "ddg", "brave", "bing")
 BROWSER_ENGINES = ("google", "ddg", "brave", "bing")
-HTTP_ENGINES = ("searxng",)
+# HTTP engines are queried over the network instead of the shared Chrome tab.
+HTTP_ENGINES = ("searxng", "serpbase")
 
 # Block pages that mean "this engine will not answer right now".
 _BLOCK_PHRASES = (
@@ -248,6 +249,29 @@ def parse_searxng(payload: dict, limit: int) -> list[dict]:
     return out
 
 
+def parse_serpbase(payload: dict, limit: int) -> list[dict]:
+    """Convert a SerpBase search response into result candidates.
+
+    SerpBase answers HTTP 200 with a business ``status`` in the body, so a
+    non-zero status is an error envelope and yields no results here; the caller
+    checks the same field before parsing. Results live under ``organic``.
+    """
+    if payload.get("status") != 0:
+        return []
+    out: list[dict] = []
+    for item in (payload.get("organic") or [])[:limit]:
+        title = clean_text(item.get("title"))
+        url = (item.get("link") or "").strip()
+        if not title or not url:
+            continue
+        out.append({
+            "title": title,
+            "href": url,
+            "description": clean_text(item.get("snippet")),
+        })
+    return out
+
+
 def looks_blocked(engine: str, challenge_text: str) -> bool:
     """Report whether a *challenge container's* text is a bot challenge.
 
@@ -262,15 +286,22 @@ def looks_blocked(engine: str, challenge_text: str) -> bool:
     return any(phrase in normalized for phrase in _BLOCK_PHRASES)
 
 
-def available_engines(configured: Iterable[str], searxng_url: str = "") -> list[str]:
-    """Filter a configured engine list down to what this deployment can run."""
+def available_engines(configured: Iterable[str], searxng_url: str = "",
+                      serpbase_key: str = "") -> list[str]:
+    """Filter a configured engine list down to what this deployment can run.
+
+    An HTTP engine is dropped rather than attempted when its credentials are
+    missing, so listing it costs nothing for deployments that do not use it.
+    """
     valid = set(BROWSER_ENGINES) | set(HTTP_ENGINES)
     out: list[str] = []
     for name in configured:
         candidate = str(name).strip().lower()
         if candidate not in valid or candidate in out:
             continue
-        if candidate in HTTP_ENGINES and not searxng_url:
+        if candidate == "searxng" and not searxng_url:
+            continue
+        if candidate == "serpbase" and not serpbase_key:
             continue
         out.append(candidate)
     return out
