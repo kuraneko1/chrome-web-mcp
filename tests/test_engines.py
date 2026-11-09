@@ -127,6 +127,25 @@ def test_searxng_json_is_mapped():
                       "description": "spaced content"}]
 
 
+def test_serpbase_organic_is_mapped():
+    payload = {"status": 0, "credits_charged": 1, "organic": [
+        {"title": "Example", "link": "https://example.com", "snippet": "  spaced\nsnippet "},
+        {"title": "No link", "link": "", "snippet": "dropped"},
+        {"title": "", "link": "https://ignored.example", "snippet": "dropped"},
+    ]}
+    items = engines.parse_serpbase(payload, 5)
+    assert items == [{"title": "Example", "href": "https://example.com",
+                      "description": "spaced snippet"}]
+
+
+def test_serpbase_error_envelope_yields_nothing():
+    # HTTP 200 is not success: the body carries the business status.
+    payload = {"status": 1002, "message": "invalid api key", "organic": [
+        {"title": "Should not appear", "link": "https://example.com"},
+    ]}
+    assert engines.parse_serpbase(payload, 5) == []
+
+
 # --------------------------------------------------------------------------- #
 # Challenge/block detection and engine selection
 # --------------------------------------------------------------------------- #
@@ -146,3 +165,13 @@ def test_available_engines_filters_and_dedupes():
     assert engines.available_engines(configured) == ["google", "ddg"]
     assert engines.available_engines(configured, "http://10.0.0.1:4000") == [
         "google", "ddg", "searxng"]
+
+
+def test_available_engines_gates_serpbase_on_its_key():
+    configured = ["google", "serpbase", "searxng"]
+    assert engines.available_engines(configured) == ["google"]
+    assert engines.available_engines(configured, "", "sb_test") == [
+        "google", "serpbase"]
+    # The SearXNG URL must not enable a keyed engine.
+    assert engines.available_engines(configured, "http://10.0.0.1:4000") == [
+        "google", "searxng"]

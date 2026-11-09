@@ -1414,11 +1414,56 @@ def _searxng_url() -> str:
     return (raw or str(CONFIG["searxng_url"])).rstrip("/")
 
 
+SERPBASE_SEARCH_URL = "https://api.serpbase.dev/google/search"
+
+
+def _serpbase_key() -> str:
+    """SerpBase API key, from the environment only - never from model output."""
+    return os.environ.get("CW_SERPBASE_API_KEY", "").strip()
+
+
+async def _serpbase_candidates(query: str, limit: int, hl: str, gl: str) -> list[dict]:
+    """Query the SerpBase REST API for Google results - no browser involved.
+
+    The key travels in the ``X-API-Key`` header (SerpBase rejects keys in the
+    query string), and the request asks for the same doubled limit the other
+    engines are given. SerpBase returns HTTP 200 with a business ``status`` in
+    the body, so ``status == 0`` is the success condition; anything else raises
+    like any other engine failure and lets the fallback path move on. The error
+    text never includes the key.
+    """
+    key = _serpbase_key()
+    if not key:
+        raise RuntimeError(
+            "serpbase engine selected but CW_SERPBASE_API_KEY is not configured"
+        )
+    body = {"q": query, "hl": hl, "gl": gl, "num": max(limit * 2, limit)}
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        response = await client.post(
+            SERPBASE_SEARCH_URL,
+            json=body,
+            headers={"X-API-Key": key, "Accept": "application/json"},
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"SerpBase returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"SerpBase did not return JSON: {exc}") from None
+    status = payload.get("status")
+    if status != 0:
+        detail = str(payload.get("message") or payload.get("error") or "")[:150]
+        raise RuntimeError(
+            f"SerpBase error status={status}" + (f": {detail}" if detail else "")
+        )
+    return engines.parse_serpbase(payload, max(limit * 2, limit))
+
+
 def _configured_engines() -> list[str]:
     """Engine order: CW_SEARCH_ENGINES (comma-separated) wins over config."""
     raw = os.environ.get("CW_SEARCH_ENGINES", "").strip()
     configured = [item for item in raw.split(",")] if raw else CONFIG["search_engines"]
-    return engines.available_engines(configured, _searxng_url())
+    return engines.available_engines(configured, _searxng_url(), _serpbase_key())
 
 
 def _human_input_enabled() -> bool:
@@ -1664,6 +1709,8 @@ async def _search_with_fallback(
             try:
                 if name == "searxng":
                     candidates = await _searxng_candidates(query, limit, hl)
+                elif name == "serpbase":
+                    candidates = await _serpbase_candidates(query, limit, hl, gl)
                 elif name == "google":
                     candidates = await _extract_google_candidates(query, limit, hl, gl)
                 else:

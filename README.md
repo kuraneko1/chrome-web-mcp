@@ -422,7 +422,8 @@ Input:
 `limit` is an integer from 1 to 20. Results are returned as structured JSON
 with `title`, `url`, `description`, and `position` fields, plus:
 
-- `engine` — which engine answered (`google`, `ddg`, `brave`, `bing`, `searxng`).
+- `engine` — which engine answered (`google`, `ddg`, `brave`, `bing`, `searxng`,
+  `serpbase`).
 - `attempts` — one entry per engine tried, with `ok`, and either the error or
   the number of results. Google challenges appear as `"error": "captcha"` with
   the `cooldown_s` applied.
@@ -555,7 +556,9 @@ values; add them only to change the behavior:
 
 - `profile`: `persistent` keeps a warm profile (fewer CAPTCHAs); `ephemeral`
   restores the throwaway per-process profile.
-- `search_engines`: engines to try, in order. `searxng` requires `searxng_url`.
+- `search_engines`: engines to try, in order. `searxng` requires `searxng_url`,
+  and `serpbase` requires `CW_SERPBASE_API_KEY`; either is skipped while its
+  credential is unset.
 - `searxng_url`: base URL of a self-hosted SearXNG (needs `format=json`). It comes
   from your config or environment, never from model output, so a private address
   (`http://127.0.0.1:8080`, `http://10.0.0.1:4000`) is allowed. Redirects are not
@@ -606,6 +609,11 @@ Optional environment variables:
   reachable: it goes through the same public-URL policy as a `fetch_url` target,
   so a private address (e.g. `http://10.0.0.1:4000`) is refused rather than
   queried.
+- `CW_SERPBASE_API_KEY` — SerpBase API key; enables the `serpbase` engine (it is
+  skipped while this is unset). The key is sent in the `X-API-Key` header to
+  `https://api.serpbase.dev/google/search`; it is never read from a tool
+  argument, so model output cannot redirect it. Requests are billed per call in
+  SerpBase credits, so only list `serpbase` if you want a hosted fallback.
 - `CW_HUMAN_INPUT` — `0` disables typing into the Google search box.
 - `CW_MAX_SEARCHES_PER_HOUR` — Google-only hourly budget (`0` disables it).
 - `CW_CAPTCHA_COOLDOWN` / `CW_CAPTCHA_COOLDOWN_MAX` — first CAPTCHA cooldown in
@@ -662,7 +670,9 @@ Google is the only engine with a cooldown and an hourly budget, because it is
 the only one that challenges; the others are the reason a challenge no longer
 fails a call. `searxng` is only tried when `searxng_url` is set, and it is
 queried over its JSON API (not through the browser, whose proxy refuses private
-addresses by design).
+addresses by design). `serpbase` is only tried when `CW_SERPBASE_API_KEY` is set,
+and it answers from a hosted API, so it keeps working on hosts where every
+browser engine is challenged at once.
 
 Google-search calls also reserve a slot in the shared SQLite queue. Separate
 MCP processes therefore start searches one at a time with a 1.0–2.5 second
